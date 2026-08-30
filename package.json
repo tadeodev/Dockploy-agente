@@ -8,7 +8,7 @@
     "dockploy-agent": "dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node --eval \"import { chmodSync } from 'node:fs'; chmodSync('dist/index.js', 0o755)\"",
     "start": "node dist/index.js run"
   },
   "devDependencies": {
