@@ -9,7 +9,7 @@ Cada cuenta de Dockploy admite **un agente activo**. Para cambiar de ordenador, 
 ## Requisitos
 
 - Node.js 20 o superior
-- [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) en el `PATH`
+- [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) en el `PATH` (el agente **no** lo instala; sin esto `dockploy-agent run` falla)
 - URL HTTPS de tu API Dockploy (en local, HTTP solo si es `localhost`)
 - Token de equipo `dcp_...` generado en Dockploy → **Túneles locales** → Registrar equipo (se muestra una sola vez)
 
@@ -17,17 +17,7 @@ El administrador de Dockploy debe tener Cloudflare named tunnels configurado en 
 
 ## Instalar
 
-```bash
-git clone https://github.com/tadeodev/Dockploy-agente.git
-cd Dockploy-agente
-npm install
-npm run build
-npm link
-```
-
-En Linux puede hacer falta `sudo npm link`.
-
-Instala también `cloudflared`:
+### 1. cloudflared (obligatorio, aparte del agente)
 
 ```bash
 # macOS
@@ -39,10 +29,23 @@ winget install --id Cloudflare.cloudflared
 
 En Ubuntu/Debian sigue la [instalación oficial de Cloudflare](https://pkg.cloudflare.com/index.html).
 
-Comprueba:
-
 ```bash
 cloudflared --version
+```
+
+### 2. Dockploy Agent
+
+```bash
+git clone https://github.com/tadeodev/Dockploy-agente.git
+cd Dockploy-agente
+npm install
+npm run build
+npm link
+```
+
+En Linux puede hacer falta `sudo npm link`.
+
+```bash
 dockploy-agent
 ```
 
