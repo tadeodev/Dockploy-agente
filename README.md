@@ -2,51 +2,37 @@
 
 Agente en **tu ordenador**. No abre puertos. Un agente activo por cuenta.
 
-API de Dockploy: `https://dockployback.gaolania.com.es`  
-Token: el `dcp_...` de **Túneles locales** → Registrar equipo (una sola vez). No es el de Cloudflare.
+## Cómo usarlo
 
-## Copiar y pegar (macOS)
+Todo lo que necesitas te lo da el **panel de Dockploy**. No hace falta inventar la URL ni el token.
+
+1. Entra en Dockploy → **Túneles locales**.
+2. **Registrar equipo** (nombre, por ejemplo `MacBook de Ana`).
+3. Se abre una ventana con los comandos ya rellenados:
+   - instalar `cloudflared` y este repo
+   - `dockploy-agent configure` con `https://dockployback.gaolania.com.es` y tu token `dcp_...`
+   - `dockploy-agent run`
+4. **Copiar comando** y pegarlos en la terminal, en orden.
+5. Deja `dockploy-agent run` abierto. Cuando el equipo esté **Online**, arranca tu app y pulsa **Publicar**.
+
+El token `dcp_...` solo se muestra esa vez. No es el de Cloudflare. No lo envíes por chat.
+
+## Si ya cerraste la ventana
+
+Vuelve a registrar no se puede si ya tienes un agente. Si aún tienes el token:
 
 ```bash
-brew install cloudflared
-git clone https://github.com/tadeodev/Dockploy-agente.git
-cd Dockploy-agente
-npm install
-npm run build
-npm link
-cloudflared --version
-dockploy-agent
-```
-
-En Dockploy, registra el equipo y copia el token. Sustituye `dcp_PEGA_EL_TOKEN` y pega:
-
-```bash
-dockploy-agent configure https://dockployback.gaolania.com.es dcp_PEGA_EL_TOKEN
+dockploy-agent configure https://dockployback.gaolania.com.es dcp_TU_TOKEN
 dockploy-agent run
 ```
 
-Deja esa terminal abierta. El equipo debe pasar a **Online**. Luego arranca tu app, comprueba `http://127.0.0.1:PUERTO` y en el panel pulsa **Publicar**.
+Si no lo guardaste, revoca el equipo (sin túneles activos) y registra de nuevo: el panel vuelve a mostrar los comandos.
+
+Config: `~/.dockploy-agent/config.json` (Windows: `%USERPROFILE%\.dockploy-agent\config.json`).
 
 ```bash
 dockploy-agent status
 ```
-
-Config: `~/.dockploy-agent/config.json`
-
-## Windows
-
-```powershell
-winget install --id Cloudflare.cloudflared
-git clone https://github.com/tadeodev/Dockploy-agente.git
-cd Dockploy-agente
-npm install
-npm run build
-npm link
-dockploy-agent configure https://dockployback.gaolania.com.es dcp_PEGA_EL_TOKEN
-dockploy-agent run
-```
-
-Linux: instala [cloudflared](https://pkg.cloudflare.com/index.html) y el mismo `git clone` … `npm link`. En `npm link` puede hacer falta `sudo`.
 
 ## Dejarlo siempre activo (Linux)
 
@@ -76,7 +62,7 @@ sudo systemctl enable --now dockploy-agent
 
 ## Problemas
 
-- **Offline:** `dockploy-agent run` tiene que seguir. La URL es `https://dockployback.gaolania.com.es`, no el frontend.
+- **Offline:** `dockploy-agent run` tiene que seguir.
 - **No hay aplicación escuchando:** abre `http://127.0.0.1:PUERTO` en este PC.
 - **Host / CORS:** permite el dominio público en tu app.
-- No envíes el token `dcp_...` por chat. Un agente por cuenta: para otro PC, revoca el equipo en el panel.
+- Otro PC: cierra túneles, **Revocar equipo**, registra de nuevo y copia lo que muestre el panel.
