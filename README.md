@@ -17,6 +17,8 @@ node dist/index.js run
 ```
 5. Deja `node dist/index.js run` abierto. Cuando el equipo esté **Online**, arranca tu app y pulsa **Publicar**.
 
+Si compartes un front que se construye (Vite, React…), no publiques `npm run dev`. Haz `npm run build` y `npm run preview -- --host 127.0.0.1 --port 4173`, y en el panel indica el **4173**. El modo desarrollo suele verse en blanco detrás del túnel.
+
 El token `dcp_...` solo se muestra esa vez. No es el de Cloudflare. No lo envíes por chat.
 
 ## Si ya cerraste la ventana
