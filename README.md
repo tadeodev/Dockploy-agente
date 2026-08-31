@@ -4,7 +4,21 @@ Agente en **tu ordenador**. No abre puertos. Un agente activo por cuenta.
 
 ## Cómo usarlo
 
-**Recomendado:** entra con tu usuario de Dockploy. El token del equipo se genera solo y, si deja de valer, el agente lo vuelve a pedir al backend.
+**Recomendado (macOS/Linux con Homebrew):** instala el agente y `cloudflared` de una vez:
+
+```bash
+brew tap tadeodev/dockploy https://github.com/tadeodev/Dockploy-agente
+brew trust tadeodev/dockploy
+brew install dockploy-agent
+dockploy-agent login https://dockployback.gaolania.com.es TU_EMAIL TU_CONTRASEÑA
+dockploy-agent start
+```
+
+`brew trust` hace falta en Homebrew 6. Desde un clon local: `brew tap tadeodev/dockploy /ruta/a/Dockploy-agente` y luego `brew install dockploy-agent`.
+
+Entra con tu usuario de Dockploy. El token del equipo se genera solo y, si deja de valer, el agente lo vuelve a pedir al backend.
+
+Sin Homebrew:
 
 ```bash
 cd ~/Dockploy-agente
@@ -14,7 +28,8 @@ node dist/index.js login https://dockployback.gaolania.com.es TU_EMAIL TU_CONTRA
 node dist/index.js start
 ```
 
-`start` deja el agente **en segundo plano**: puedes cerrar la terminal y los túneles siguen abiertos. Para pararlo, `node dist/index.js stop` (los túneles publicados dejan de responder).
+`start` deja el agente **en segundo plano**: puedes cerrar la terminal y los túneles siguen abiertos. Para pararlo, `dockploy-agent stop` (o `node dist/index.js stop`).
+
 
 No guarda la contraseña; guarda un token de equipo y la sesión para poder renovarlo. El `dcp_...` del panel **no caduca** por tiempo: solo deja de valer si revocas el equipo o si `login` genera uno nuevo.
 
@@ -63,6 +78,7 @@ After=network-online.target
 Type=simple
 User=USUARIO_LOCAL
 ExecStart=/usr/local/bin/dockploy-agent run
+# Con Homebrew: ExecStart=/opt/homebrew/bin/dockploy-agent run  (o `which dockploy-agent`)
 Restart=always
 RestartSec=5
 Environment=HOME=/home/USUARIO_LOCAL
@@ -80,7 +96,15 @@ El servicio usa `run` a propósito: quien vigila el proceso es systemd, no hace 
 
 ## Dejarlo siempre activo (macOS)
 
-`~/Library/LaunchAgents/com.dockploy.agent.plist`, cambiando `TU_USUARIO` y la ruta de `node` (`which node`):
+Si lo instalaste con Homebrew:
+
+```bash
+brew services start dockploy-agent
+```
+
+Eso usa `run` (no combines con `dockploy-agent start`). Para quitarlo: `brew services stop dockploy-agent`.
+
+Sin Homebrew, `~/Library/LaunchAgents/com.dockploy.agent.plist`, cambiando `TU_USUARIO` y la ruta de `node` (`which node`):
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
