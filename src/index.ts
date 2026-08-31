@@ -6,7 +6,7 @@ import { homedir, hostname, platform } from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
 
-const VERSION = '0.1.0'
+const VERSION = '0.2.0'
 const CONFIG_DIR = path.join(homedir(), '.dockploy-agent')
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json')
 const HEARTBEAT_MS = 5_000
@@ -14,6 +14,7 @@ const HEARTBEAT_MS = 5_000
 interface AgentConfig {
   serverUrl: string
   token: string
+  refreshToken?: string
 }
 
 interface StartCommand {
@@ -42,12 +43,16 @@ function usage(): void {
   console.log(`Dockploy Agent ${VERSION}
 
 Uso:
+  dockploy-agent login <URL_DOCKPLOY> <EMAIL_O_NOMBRE> <CONTRASEÑA>
   dockploy-agent configure <URL_DOCKPLOY> <TOKEN_EQUIPO>
   dockploy-agent run
   dockploy-agent status
 
+El login usa tu cuenta de Dockploy y renueva solo el token del equipo.
+configure sigue valiendo si ya tienes un token dcp_ del panel.
+
 Ejemplo:
-  dockploy-agent configure https://dockploy.example.com dcp_xxxxx
+  dockploy-agent login https://dockployback.gaolania.com.es ana@empresa.com tuclave
   dockploy-agent run`)
 }
 
@@ -60,22 +65,97 @@ function normalizeServerUrl(value: string): string {
   return url.toString().replace(/\/$/, '')
 }
 
-async function saveConfig(serverUrl: string, token: string): Promise<void> {
-  if (!token.startsWith('dcp_')) throw new Error('El token del equipo no es válido')
+async function writeConfig(config: AgentConfig): Promise<void> {
   await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 })
-  await writeFile(
-    CONFIG_PATH,
-    JSON.stringify({ serverUrl: normalizeServerUrl(serverUrl), token }, null, 2),
-    { mode: 0o600 },
-  )
+  await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 })
+}
+
+async function saveConfig(serverUrl: string, token: string, refreshToken?: string): Promise<void> {
+  if (!token.startsWith('dcp_')) throw new Error('El token del equipo no es válido')
+  await writeConfig({
+    serverUrl: normalizeServerUrl(serverUrl),
+    token,
+    ...(refreshToken ? { refreshToken } : {}),
+  })
 }
 
 async function loadConfig(): Promise<AgentConfig> {
   const raw = await readFile(CONFIG_PATH, 'utf8').catch(() => '')
-  if (!raw) throw new Error('Agente no configurado. Ejecuta dockploy-agent configure <URL> <TOKEN>')
+  if (!raw) throw new Error('Agente no configurado. Ejecuta dockploy-agent login <URL> <EMAIL> <CONTRASEÑA>')
   const parsed = JSON.parse(raw) as Partial<AgentConfig>
   if (!parsed.serverUrl || !parsed.token) throw new Error('Configuración del agente incompleta')
-  return { serverUrl: normalizeServerUrl(parsed.serverUrl), token: parsed.token }
+  return {
+    serverUrl: normalizeServerUrl(parsed.serverUrl),
+    token: parsed.token,
+    refreshToken: parsed.refreshToken,
+  }
+}
+
+async function postJson<T>(
+  serverUrl: string,
+  endpoint: string,
+  body: unknown,
+  bearer?: string,
+): Promise<T> {
+  const response = await fetch(`${serverUrl}${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
+    },
+    body: JSON.stringify(body),
+  })
+  const payload = await response.json().catch(() => ({})) as { error?: string }
+  if (!response.ok) {
+    throw new Error(payload.error || `Dockploy respondió ${response.status}`)
+  }
+  return payload as T
+}
+
+async function enrollDevice(
+  serverUrl: string,
+  accessToken: string,
+  name: string,
+): Promise<string> {
+  const enrolled = await postJson<{ token: string }>(
+    serverUrl,
+    '/api/remote-connectors/enroll',
+    { name },
+    accessToken,
+  )
+  if (!enrolled.token?.startsWith('dcp_')) throw new Error('Dockploy no devolvió un token de equipo')
+  return enrolled.token
+}
+
+async function refreshUserSession(config: AgentConfig): Promise<AgentConfig & { accessToken: string }> {
+  if (!config.refreshToken) throw new Error('No hay sesión de usuario guardada')
+  const session = await postJson<{ accessToken: string; refreshToken: string }>(
+    config.serverUrl,
+    '/api/auth/refresh',
+    { refreshToken: config.refreshToken },
+  )
+  const next = { ...config, refreshToken: session.refreshToken }
+  await writeConfig(next)
+  return { ...next, accessToken: session.accessToken }
+}
+
+async function renewDeviceToken(config: AgentConfig): Promise<AgentConfig> {
+  const withSession = await refreshUserSession(config)
+  const token = await enrollDevice(withSession.serverUrl, withSession.accessToken, hostname())
+  const next = { serverUrl: withSession.serverUrl, token, refreshToken: withSession.refreshToken }
+  await writeConfig(next)
+  return next
+}
+
+async function loginAndEnroll(serverUrl: string, identifier: string, password: string): Promise<void> {
+  const url = normalizeServerUrl(serverUrl)
+  const session = await postJson<{ accessToken: string; refreshToken: string }>(
+    url,
+    '/api/auth/login',
+    { email: identifier, password },
+  )
+  const token = await enrollDevice(url, session.accessToken, hostname())
+  await saveConfig(url, token, session.refreshToken)
 }
 
 async function api<T>(
@@ -209,6 +289,19 @@ async function heartbeat(config: AgentConfig): Promise<void> {
   }
 }
 
+async function heartbeatWithRenewal(config: AgentConfig): Promise<AgentConfig> {
+  try {
+    await heartbeat(config)
+    return config
+  } catch (error: any) {
+    if (!/Invalid connector token/i.test(error.message) || !config.refreshToken) throw error
+    console.log('El token del equipo ya no vale. Renovando con la sesión de Dockploy...')
+    const renewed = await renewDeviceToken(config)
+    await heartbeat(renewed)
+    return renewed
+  }
+}
+
 function assertCloudflaredInstalled(): void {
   const result = spawnSync('cloudflared', ['--version'], { stdio: 'ignore' })
   if (result.error || result.status !== 0) {
@@ -217,7 +310,7 @@ function assertCloudflaredInstalled(): void {
 }
 
 async function runAgent(): Promise<void> {
-  const config = await loadConfig()
+  let config = await loadConfig()
   assertCloudflaredInstalled()
   console.log(`Dockploy Agent ${VERSION} iniciado en ${hostname()}`)
   console.log(`Conectando con ${config.serverUrl}`)
@@ -237,10 +330,11 @@ async function runAgent(): Promise<void> {
 
   while (!stopping) {
     try {
-      await heartbeat(config)
+      config = await heartbeatWithRenewal(config)
     } catch (error: any) {
       console.error('Heartbeat fallido:', error.message)
       if (/Invalid connector token/i.test(error.message)) {
+        console.error('Vuelve a emparejar con: dockploy-agent login <URL> <EMAIL> <CONTRASEÑA>')
         shutdown()
         throw error
       }
@@ -251,6 +345,16 @@ async function runAgent(): Promise<void> {
 
 async function main(): Promise<void> {
   const [, , command, ...args] = process.argv
+  if (command === 'login') {
+    if (args.length !== 3) {
+      usage()
+      process.exitCode = 1
+      return
+    }
+    await loginAndEnroll(args[0], args[1], args[2])
+    console.log(`Sesión y token de equipo guardados en ${CONFIG_PATH}`)
+    return
+  }
   if (command === 'configure') {
     if (args.length !== 2) {
       usage()
