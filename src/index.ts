@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import { constants } from 'node:fs'
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { constants, openSync } from 'node:fs'
+import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { homedir, hostname, platform } from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
+import { fileURLToPath } from 'node:url'
 
-const VERSION = '0.2.0'
+const VERSION = '0.3.0'
 const CONFIG_DIR = path.join(homedir(), '.dockploy-agent')
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json')
+const PID_PATH = path.join(CONFIG_DIR, 'agent.pid')
+const LOG_PATH = path.join(CONFIG_DIR, 'agent.log')
 const HEARTBEAT_MS = 5_000
 
 interface AgentConfig {
@@ -45,15 +48,18 @@ function usage(): void {
 Uso:
   dockploy-agent login <URL_DOCKPLOY> <EMAIL_O_NOMBRE> <CONTRASEÑA>
   dockploy-agent configure <URL_DOCKPLOY> <TOKEN_EQUIPO>
-  dockploy-agent run
+  dockploy-agent start          Arranca en segundo plano
+  dockploy-agent stop           Detiene el proceso en segundo plano
+  dockploy-agent logs           Muestra el registro
+  dockploy-agent run            Arranca en primer plano (ocupa la terminal)
   dockploy-agent status
 
+Con start puedes cerrar la terminal: el agente sigue corriendo.
 El login usa tu cuenta de Dockploy y renueva solo el token del equipo.
-configure sigue valiendo si ya tienes un token dcp_ del panel.
 
 Ejemplo:
   dockploy-agent login https://dockployback.gaolania.com.es ana@empresa.com tuclave
-  dockploy-agent run`)
+  dockploy-agent start`)
 }
 
 function normalizeServerUrl(value: string): string {
@@ -343,6 +349,79 @@ async function runAgent(): Promise<void> {
   }
 }
 
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error: any) {
+    return error?.code === 'EPERM'
+  }
+}
+
+async function readDaemonPid(): Promise<number | null> {
+  let raw: string
+  try {
+    raw = await readFile(PID_PATH, 'utf8')
+  } catch {
+    return null
+  }
+  const pid = Number.parseInt(raw.trim(), 10)
+  if (!Number.isInteger(pid) || pid <= 0) return null
+  if (processAlive(pid)) return pid
+  await rm(PID_PATH, { force: true })
+  return null
+}
+
+async function startDaemon(): Promise<void> {
+  const running = await readDaemonPid()
+  if (running) {
+    console.log(`El agente ya está funcionando en segundo plano (PID ${running}).`)
+    return
+  }
+  await loadConfig()
+  assertCloudflaredInstalled()
+  await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 })
+  const log = openSync(LOG_PATH, 'a', 0o600)
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'run'], {
+    detached: true,
+    stdio: ['ignore', log, log],
+  })
+  child.unref()
+  if (!child.pid) throw new Error('No se pudo arrancar el agente en segundo plano')
+  await writeFile(PID_PATH, `${child.pid}\n`, { mode: 0o600 })
+  console.log(`Agente arrancado en segundo plano (PID ${child.pid}). Ya puedes cerrar la terminal.`)
+  console.log(`Registro: ${LOG_PATH}`)
+}
+
+async function stopDaemon(): Promise<void> {
+  const pid = await readDaemonPid()
+  if (!pid) {
+    console.log('No hay ningún agente en segundo plano.')
+    await rm(PID_PATH, { force: true })
+    return
+  }
+  process.kill(pid, 'SIGTERM')
+  for (let i = 0; i < 50 && processAlive(pid); i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  if (processAlive(pid)) process.kill(pid, 'SIGKILL')
+  await rm(PID_PATH, { force: true })
+  console.log('Agente detenido. Los túneles publicados dejan de estar accesibles.')
+}
+
+async function showLogs(count: number): Promise<void> {
+  let content: string
+  try {
+    content = await readFile(LOG_PATH, 'utf8')
+  } catch {
+    console.log('Todavía no hay registro. Arranca el agente con: dockploy-agent start')
+    return
+  }
+  const lines = content.split('\n').filter((line) => line.length > 0)
+  console.log(lines.slice(-count).join('\n'))
+  console.log(`\n(${LOG_PATH})`)
+}
+
 async function main(): Promise<void> {
   const [, , command, ...args] = process.argv
   if (command === 'login') {
@@ -368,11 +447,29 @@ async function main(): Promise<void> {
   if (command === 'status') {
     await access(CONFIG_PATH, constants.R_OK)
     const config = await loadConfig()
+    const pid = await readDaemonPid()
     console.log(`Configurado para ${config.serverUrl}`)
-    console.log(`Procesos de túnel activos: ${processes.size}`)
+    console.log(pid ? `En segundo plano, funcionando (PID ${pid})` : 'Parado. Arráncalo con: dockploy-agent start')
+    return
+  }
+  if (command === 'start') {
+    await startDaemon()
+    return
+  }
+  if (command === 'stop') {
+    await stopDaemon()
+    return
+  }
+  if (command === 'logs') {
+    const count = Number.parseInt(args[0] ?? '', 10)
+    await showLogs(Number.isInteger(count) && count > 0 ? count : 50)
     return
   }
   if (command === 'run') {
+    const running = await readDaemonPid()
+    if (running && running !== process.pid) {
+      throw new Error(`Ya hay un agente en segundo plano (PID ${running}). Detenlo con: dockploy-agent stop`)
+    }
     await runAgent()
     return
   }
