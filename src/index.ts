@@ -7,7 +7,7 @@ import path from 'node:path'
 import net from 'node:net'
 import { fileURLToPath } from 'node:url'
 
-const VERSION = '0.3.0'
+const VERSION = '0.4.0'
 const CONFIG_DIR = path.join(homedir(), '.dockploy-agent')
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json')
 const PID_PATH = path.join(CONFIG_DIR, 'agent.pid')
@@ -33,14 +33,33 @@ interface StopCommand {
   tunnelId: string
 }
 
-type AgentCommand = StartCommand | StopCommand
+interface StartDbProxyCommand {
+  action: 'start-db-proxy'
+  sessionId: string
+  alias: string
+  engine: string
+}
+
+interface StopDbProxyCommand {
+  action: 'stop-db-proxy'
+  sessionId: string
+}
+
+type AgentCommand = StartCommand | StopCommand | StartDbProxyCommand | StopDbProxyCommand
 
 interface ManagedProcess {
   child: ChildProcess
   stopping: boolean
 }
 
+interface ManagedDbProxy {
+  server: net.Server
+  sockets: Set<net.Socket>
+  stopping: boolean
+}
+
 const processes = new Map<string, ManagedProcess>()
+const dbProxies = new Map<string, ManagedDbProxy>()
 
 function usage(): void {
   console.log(`Dockploy Agent ${VERSION}
@@ -266,6 +285,111 @@ async function startTunnel(config: AgentConfig, command: StartCommand): Promise<
   })
 }
 
+async function reportDbStatus(
+  config: AgentConfig,
+  sessionId: string,
+  status: 'starting' | 'running' | 'error' | 'stopped',
+  extra: { error?: string; localPort?: number } = {},
+): Promise<void> {
+  await api(config, `/api/remote-agent/db-proxies/${sessionId}/status`, {
+    method: 'POST',
+    body: JSON.stringify({ status, ...extra }),
+  }).catch((statusError) => {
+    console.error(`[db ${sessionId}] No se pudo reportar estado:`, statusError.message)
+  })
+}
+
+function websocketUrl(serverUrl: string, path: string, token: string): string {
+  const url = new URL(path, `${serverUrl}/`)
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+  url.searchParams.set('token', token)
+  return url.toString()
+}
+
+function pipeClientToDatabase(config: AgentConfig, sessionId: string, client: net.Socket): void {
+  const WebSocketImpl = (globalThis as typeof globalThis & { WebSocket?: typeof WebSocket }).WebSocket
+  if (!WebSocketImpl) {
+    client.destroy()
+    return
+  }
+  const ws = new WebSocketImpl(websocketUrl(config.serverUrl, `/api/remote-agent/db-proxy/${sessionId}`, config.token))
+  ws.binaryType = 'arraybuffer'
+  const pending: Buffer[] = []
+  const send = (chunk: Buffer) => {
+    if (ws.readyState === WebSocketImpl.OPEN) ws.send(new Uint8Array(chunk))
+    else pending.push(chunk)
+  }
+  client.on('data', (chunk) => send(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)))
+  ws.addEventListener('open', () => {
+    for (const chunk of pending) ws.send(new Uint8Array(chunk))
+    pending.length = 0
+  })
+  ws.addEventListener('message', (event) => {
+    const raw = event.data
+    if (client.destroyed) return
+    if (raw instanceof ArrayBuffer) client.write(Buffer.from(raw))
+    else if (Buffer.isBuffer(raw)) client.write(raw)
+    else if (typeof raw === 'string') client.write(raw)
+  })
+  const closeBoth = () => {
+    client.destroy()
+    if (ws.readyState === WebSocketImpl.OPEN || ws.readyState === WebSocketImpl.CONNECTING) ws.close()
+  }
+  ws.addEventListener('close', () => client.destroy())
+  ws.addEventListener('error', () => closeBoth())
+  client.on('error', closeBoth)
+  client.on('close', () => {
+    if (ws.readyState === WebSocketImpl.OPEN || ws.readyState === WebSocketImpl.CONNECTING) ws.close()
+  })
+}
+
+async function startDbProxy(config: AgentConfig, command: StartDbProxyCommand): Promise<void> {
+  if (dbProxies.has(command.sessionId)) return
+  console.log(`[${command.alias}] Abriendo ${command.engine} en este equipo...`)
+  const sockets = new Set<net.Socket>()
+  const server = net.createServer((client) => {
+    sockets.add(client)
+    client.on('close', () => sockets.delete(client))
+    pipeClientToDatabase(config, command.sessionId, client)
+  })
+  const managed: ManagedDbProxy = { server, sockets, stopping: false }
+  dbProxies.set(command.sessionId, managed)
+  await reportDbStatus(config, command.sessionId, 'starting')
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(0, '127.0.0.1', () => resolve())
+    })
+  } catch (error: any) {
+    dbProxies.delete(command.sessionId)
+    await reportDbStatus(config, command.sessionId, 'error', { error: error.message })
+    return
+  }
+
+  const address = server.address()
+  if (!address || typeof address === 'string') {
+    dbProxies.delete(command.sessionId)
+    await reportDbStatus(config, command.sessionId, 'error', { error: 'No se pudo reservar un puerto local' })
+    return
+  }
+  await reportDbStatus(config, command.sessionId, 'running', { localPort: address.port })
+  console.log(`[${command.alias}] Listo en 127.0.0.1:${address.port}`)
+}
+
+async function stopDbProxy(config: AgentConfig, sessionId: string): Promise<void> {
+  const managed = dbProxies.get(sessionId)
+  if (!managed) {
+    await reportDbStatus(config, sessionId, 'stopped')
+    return
+  }
+  managed.stopping = true
+  for (const socket of managed.sockets) socket.destroy()
+  await new Promise<void>((resolve) => managed.server.close(() => resolve()))
+  dbProxies.delete(sessionId)
+  await reportDbStatus(config, sessionId, 'stopped')
+}
+
 async function stopTunnel(config: AgentConfig, tunnelId: string): Promise<void> {
   const managed = processes.get(tunnelId)
   if (!managed) {
@@ -291,7 +415,9 @@ async function heartbeat(config: AgentConfig): Promise<void> {
 
   for (const command of response.commands) {
     if (command.action === 'start') await startTunnel(config, command)
-    else await stopTunnel(config, command.tunnelId)
+    else if (command.action === 'stop') await stopTunnel(config, command.tunnelId)
+    else if (command.action === 'start-db-proxy') await startDbProxy(config, command)
+    else if (command.action === 'stop-db-proxy') await stopDbProxy(config, command.sessionId)
   }
 }
 
@@ -328,6 +454,12 @@ async function runAgent(): Promise<void> {
     for (const managed of processes.values()) {
       managed.stopping = true
       managed.child.kill('SIGTERM')
+    }
+    for (const [sessionId, managed] of dbProxies) {
+      managed.stopping = true
+      for (const socket of managed.sockets) socket.destroy()
+      managed.server.close()
+      dbProxies.delete(sessionId)
     }
     setTimeout(() => process.exit(0), 1_000).unref()
   }
