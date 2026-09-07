@@ -1,13 +1,19 @@
 #!/usr/bin/env node
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { createInterface } from 'node:readline'
 import { constants, openSync } from 'node:fs'
 import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
-import { homedir, hostname, platform } from 'node:os'
+import { cpus, freemem, homedir, hostname, platform, totalmem } from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
 import { fileURLToPath } from 'node:url'
+import { stdin as stdinStream, stdout as stdoutStream } from 'node:process'
+import { recommendedConcurrency } from './capacity.js'
+import { installChromium, isChromiumReady } from './chromium.js'
+import { runLoadTest } from './loadTest.js'
+import { normalizeScenario, type StartLoadTestCommand } from './loadTestTypes.js'
 
-const VERSION = '0.4.0'
+const VERSION = '0.5.0'
 const CONFIG_DIR = path.join(homedir(), '.dockploy-agent')
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json')
 const PID_PATH = path.join(CONFIG_DIR, 'agent.pid')
@@ -45,7 +51,24 @@ interface StopDbProxyCommand {
   sessionId: string
 }
 
-type AgentCommand = StartCommand | StopCommand | StartDbProxyCommand | StopDbProxyCommand
+interface PrepareLoadTestingCommand {
+  action: 'prepare-load-testing'
+  runId?: string
+}
+
+interface CancelLoadTestCommand {
+  action: 'cancel-load-test'
+  runId: string
+}
+
+type AgentCommand =
+  | StartCommand
+  | StopCommand
+  | StartDbProxyCommand
+  | StopDbProxyCommand
+  | PrepareLoadTestingCommand
+  | StartLoadTestCommand
+  | CancelLoadTestCommand
 
 interface ManagedProcess {
   child: ChildProcess
@@ -60,6 +83,9 @@ interface ManagedDbProxy {
 
 const processes = new Map<string, ManagedProcess>()
 const dbProxies = new Map<string, ManagedDbProxy>()
+let chromiumReady = false
+let installingChromium = false
+let activeLoadTest: { runId: string; abort: AbortController } | undefined
 
 function usage(): void {
   console.log(`Dockploy Agent ${VERSION}
@@ -71,6 +97,7 @@ Uso:
   dockploy-agent stop           Detiene el proceso en segundo plano
   dockploy-agent logs           Muestra el registro
   dockploy-agent run            Arranca en primer plano (ocupa la terminal)
+  dockploy-agent prepare        Instala Chromium para simulaciones de carga
   dockploy-agent status
 
 Con start puedes cerrar la terminal: el agente sigue corriendo.
@@ -403,6 +430,108 @@ async function stopTunnel(config: AgentConfig, tunnelId: string): Promise<void> 
   }, 5_000).unref()
 }
 
+async function reportLoadTest(
+  config: AgentConfig,
+  runId: string,
+  endpoint: 'status' | 'progress' | 'users' | 'complete',
+  body: unknown,
+): Promise<void> {
+  await api(config, `/api/remote-agent/load-tests/${runId}/${endpoint}`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }).catch((error) => {
+    console.error(`[load-test ${runId}] No se pudo reportar ${endpoint}:`, error.message)
+  })
+}
+
+async function ensureChromium(config: AgentConfig, runId?: string): Promise<boolean> {
+  if (chromiumReady || await isChromiumReady()) {
+    chromiumReady = true
+    return true
+  }
+  if (installingChromium) return false
+  installingChromium = true
+  try {
+    if (runId) await reportLoadTest(config, runId, 'status', { status: 'preparing', message: 'Instalando Chromium...' })
+    console.log('Instalando Chromium para simulaciones de carga...')
+    await installChromium((line) => console.log(line))
+    chromiumReady = true
+    if (runId) await reportLoadTest(config, runId, 'status', { status: 'queued', message: 'Chromium listo' })
+    return true
+  } catch (error: any) {
+    if (runId) {
+      await reportLoadTest(config, runId, 'complete', {
+        status: 'failed',
+        failureReason: error.message || 'No se pudo instalar Chromium',
+      })
+    }
+    throw error
+  } finally {
+    installingChromium = false
+  }
+}
+
+async function startLoadTest(config: AgentConfig, command: StartLoadTestCommand): Promise<void> {
+  if (activeLoadTest) {
+    if (activeLoadTest.runId === command.runId) return
+    await reportLoadTest(config, command.runId, 'complete', {
+      status: 'failed',
+      failureReason: 'Este equipo ya tiene una simulación en curso',
+    })
+    return
+  }
+  const abort = new AbortController()
+  activeLoadTest = { runId: command.runId, abort }
+  try {
+    if (!await ensureChromium(config, command.runId)) return
+    await reportLoadTest(config, command.runId, 'status', { status: 'running', message: 'Lanzando usuarios virtuales' })
+    console.log(`[load-test ${command.runId}] ${command.virtualUsers} usuarios → ${command.targetUrl}`)
+    const result = await runLoadTest({
+      ...command,
+      scenario: normalizeScenario(command.scenario),
+    }, {
+      signal: abort.signal,
+      onProgress: async (progress, batch) => {
+        await reportLoadTest(config, command.runId, 'progress', progress)
+        if (batch.length > 0) {
+          await reportLoadTest(config, command.runId, 'users', {
+            users: batch,
+          })
+        }
+      },
+    })
+    await reportLoadTest(config, command.runId, 'complete', {
+      status: result.status,
+      failureReason: result.failureReason,
+      timeline: result.timeline,
+    })
+  } catch (error: any) {
+    await reportLoadTest(config, command.runId, 'complete', {
+      status: 'failed',
+      failureReason: error.message || 'La simulación falló',
+    })
+  } finally {
+    if (activeLoadTest?.runId === command.runId) activeLoadTest = undefined
+  }
+}
+
+function cancelLoadTest(runId: string): void {
+  if (activeLoadTest?.runId === runId) activeLoadTest.abort.abort()
+}
+
+function loadTestingHeartbeatPayload() {
+  return {
+    supported: true,
+    chromiumReady,
+    installing: installingChromium,
+    busy: Boolean(activeLoadTest),
+    recommendedConcurrency: recommendedConcurrency({ cpus: cpus().length, freeMem: freemem() }),
+    cpuCount: cpus().length,
+    memoryBytes: totalmem(),
+    freeMemoryBytes: freemem(),
+  }
+}
+
 async function heartbeat(config: AgentConfig): Promise<void> {
   const response = await api<{ commands: AgentCommand[] }>(config, '/api/remote-agent/heartbeat', {
     method: 'POST',
@@ -410,6 +539,7 @@ async function heartbeat(config: AgentConfig): Promise<void> {
       hostname: hostname(),
       platform: `${platform()}-${process.arch}`,
       version: VERSION,
+      loadTesting: loadTestingHeartbeatPayload(),
     }),
   })
 
@@ -418,6 +548,9 @@ async function heartbeat(config: AgentConfig): Promise<void> {
     else if (command.action === 'stop') await stopTunnel(config, command.tunnelId)
     else if (command.action === 'start-db-proxy') await startDbProxy(config, command)
     else if (command.action === 'stop-db-proxy') await stopDbProxy(config, command.sessionId)
+    else if (command.action === 'prepare-load-testing') void ensureChromium(config, command.runId)
+    else if (command.action === 'start-load-test') void startLoadTest(config, command)
+    else if (command.action === 'cancel-load-test') cancelLoadTest(command.runId)
   }
 }
 
@@ -444,8 +577,12 @@ function assertCloudflaredInstalled(): void {
 async function runAgent(): Promise<void> {
   let config = await loadConfig()
   assertCloudflaredInstalled()
+  chromiumReady = await isChromiumReady()
   console.log(`Dockploy Agent ${VERSION} iniciado en ${hostname()}`)
   console.log(`Conectando con ${config.serverUrl}`)
+  if (!chromiumReady) {
+    console.log('Chromium no está instalado. Las simulaciones pedirán instalarlo o ejecuta: dockploy-agent prepare')
+  }
 
   let stopping = false
   const shutdown = () => {
@@ -461,6 +598,7 @@ async function runAgent(): Promise<void> {
       managed.server.close()
       dbProxies.delete(sessionId)
     }
+    activeLoadTest?.abort.abort()
     setTimeout(() => process.exit(0), 1_000).unref()
   }
   process.on('SIGINT', shutdown)
@@ -582,6 +720,28 @@ async function main(): Promise<void> {
     const pid = await readDaemonPid()
     console.log(`Configurado para ${config.serverUrl}`)
     console.log(pid ? `En segundo plano, funcionando (PID ${pid})` : 'Parado. Arráncalo con: dockploy-agent start')
+    console.log(`Simulaciones: Chromium ${(await isChromiumReady()) ? 'listo' : 'pendiente (dockploy-agent prepare)'}`)
+    return
+  }
+  if (command === 'prepare') {
+    const ready = await isChromiumReady()
+    if (ready) {
+      console.log('Chromium ya está instalado.')
+      return
+    }
+    if (stdinStream.isTTY) {
+      const rl = createInterface({ input: stdinStream, output: stdoutStream })
+      const answer = await new Promise<string>((resolve) => {
+        rl.question('¿Instalar Chromium para las simulaciones de carga? [s/N] ', resolve)
+      })
+      rl.close()
+      if (!/^s(i|í)?$/i.test(answer.trim())) {
+        console.log('Instalación cancelada.')
+        return
+      }
+    }
+    await installChromium((line) => console.log(line))
+    console.log('Chromium listo para simulaciones.')
     return
   }
   if (command === 'start') {
