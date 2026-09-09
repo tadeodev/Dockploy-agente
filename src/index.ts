@@ -8,7 +8,9 @@ import path from 'node:path'
 import net from 'node:net'
 import { fileURLToPath } from 'node:url'
 import { stdin as stdinStream, stdout as stdoutStream } from 'node:process'
+import { HEARTBEAT_MS, nextDelayMs, shouldLogFailure } from './backoff.js'
 import { recommendedConcurrency } from './capacity.js'
+import { once } from './once.js'
 import { installChromium, isChromiumReady } from './chromium.js'
 import { runLoadTest } from './loadTest.js'
 import { normalizeScenario, type StartLoadTestCommand } from './loadTestTypes.js'
@@ -18,7 +20,6 @@ const CONFIG_DIR = path.join(homedir(), '.dockploy-agent')
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json')
 const PID_PATH = path.join(CONFIG_DIR, 'agent.pid')
 const LOG_PATH = path.join(CONFIG_DIR, 'agent.log')
-const HEARTBEAT_MS = 5_000
 
 interface AgentConfig {
   serverUrl: string
@@ -225,7 +226,14 @@ async function api<T>(
   })
   const body = await response.json().catch(() => ({})) as { error?: string }
   if (!response.ok) {
-    throw new Error(body.error || `Dockploy respondió ${response.status}`)
+    const message = response.status === 429
+      ? 'Dockploy está limitando las peticiones de este equipo (429)'
+      : body.error || `Dockploy respondió ${response.status}`
+    const retryAfter = Number(response.headers.get('retry-after'))
+    throw Object.assign(new Error(message), {
+      statusCode: response.status,
+      retryAfterSeconds: Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined,
+    })
   }
   return body as T
 }
@@ -358,16 +366,20 @@ function pipeClientToDatabase(config: AgentConfig, sessionId: string, client: ne
     else if (Buffer.isBuffer(raw)) client.write(raw)
     else if (typeof raw === 'string') client.write(raw)
   })
-  const closeBoth = () => {
+  const closeBoth = once(() => {
     client.destroy()
-    if (ws.readyState === WebSocketImpl.OPEN || ws.readyState === WebSocketImpl.CONNECTING) ws.close()
-  }
-  ws.addEventListener('close', () => client.destroy())
-  ws.addEventListener('error', () => closeBoth())
-  client.on('error', closeBoth)
-  client.on('close', () => {
-    if (ws.readyState === WebSocketImpl.OPEN || ws.readyState === WebSocketImpl.CONNECTING) ws.close()
+    if (ws.readyState === WebSocketImpl.OPEN || ws.readyState === WebSocketImpl.CONNECTING) {
+      try {
+        ws.close()
+      } catch {
+        // El socket ya se estaba cerrando por su cuenta.
+      }
+    }
   })
+  ws.addEventListener('close', closeBoth)
+  ws.addEventListener('error', closeBoth)
+  client.on('error', closeBoth)
+  client.on('close', closeBoth)
 }
 
 async function startDbProxy(config: AgentConfig, command: StartDbProxyCommand): Promise<void> {
@@ -604,18 +616,37 @@ async function runAgent(): Promise<void> {
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
 
+  // Un fallo aislado en un socket no debe llevarse por delante los túneles abiertos.
+  process.on('uncaughtException', (error) => {
+    console.error('Error no controlado:', error instanceof Error ? error.stack || error.message : error)
+  })
+  process.on('unhandledRejection', (reason) => {
+    console.error('Promesa rechazada sin gestionar:', reason instanceof Error ? reason.message : reason)
+  })
+
+  let failures = 0
+  let retryAfterSeconds: number | undefined
+
   while (!stopping) {
     try {
       config = await heartbeatWithRenewal(config)
+      if (failures > 0) console.log('Conexión con Dockploy restablecida.')
+      failures = 0
+      retryAfterSeconds = undefined
     } catch (error: any) {
-      console.error('Heartbeat fallido:', error.message)
+      failures += 1
+      retryAfterSeconds = error.retryAfterSeconds
+      if (shouldLogFailure(failures)) {
+        console.error(`Heartbeat fallido (${failures}):`, error.message)
+      }
       if (/Invalid connector token/i.test(error.message)) {
         console.error('Vuelve a emparejar con: dockploy-agent login <URL> <EMAIL> <CONTRASEÑA>')
         shutdown()
         throw error
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, HEARTBEAT_MS))
+    const delay = failures === 0 ? HEARTBEAT_MS : nextDelayMs({ failures, retryAfterSeconds })
+    await new Promise((resolve) => setTimeout(resolve, delay))
   }
 }
 

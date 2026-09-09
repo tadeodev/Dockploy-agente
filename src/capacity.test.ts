@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { HEARTBEAT_MS, MAX_BACKOFF_MS, nextDelayMs, shouldLogFailure } from './backoff.js'
 import { mapPool, recommendedConcurrency } from './capacity.js'
+import { once } from './once.js'
 import { buildTimeline } from './loadTest.js'
 import { looksLikeCssSelector, normalizeScenario, parseClickTarget } from './loadTestTypes.js'
 import type { VirtualUserResult } from './loadTestTypes.js'
@@ -9,6 +11,43 @@ test('recommendedConcurrency se acota a CPU, memoria y 25', () => {
   assert.equal(recommendedConcurrency({ cpus: 8, freeMem: 16 * 1024 * 1024 * 1024 }), 21)
   assert.equal(recommendedConcurrency({ cpus: 2, freeMem: 512 * 1024 * 1024 }), 2)
   assert.equal(recommendedConcurrency({ cpus: 1, freeMem: 128 * 1024 * 1024 }), 1)
+})
+
+test('nextDelayMs espacia los reintentos y respeta Retry-After', () => {
+  const random = () => 0.5
+  assert.equal(nextDelayMs({ failures: 0, random }), HEARTBEAT_MS)
+  assert.equal(nextDelayMs({ failures: 1, random }), HEARTBEAT_MS)
+  assert.equal(nextDelayMs({ failures: 3, random }), 20_000)
+  assert.equal(nextDelayMs({ failures: 20, random }), MAX_BACKOFF_MS)
+  assert.equal(nextDelayMs({ failures: 1, retryAfterSeconds: 30, random }), 30_000)
+  // Retry-After nunca deja el reintento por debajo del ritmo normal ni por encima del tope.
+  assert.equal(nextDelayMs({ failures: 1, retryAfterSeconds: 1, random }), HEARTBEAT_MS)
+  assert.equal(nextDelayMs({ failures: 1, retryAfterSeconds: 3_600, random }), MAX_BACKOFF_MS)
+})
+
+test('nextDelayMs aplica jitter dentro de un margen del 20%', () => {
+  const low = nextDelayMs({ failures: 3, random: () => 0 })
+  const high = nextDelayMs({ failures: 3, random: () => 1 })
+  assert.equal(low, 16_000)
+  assert.equal(high, 24_000)
+})
+
+test('once corta la reentrada aunque el propio cierre se rellame', () => {
+  let calls = 0
+  const close: () => void = once(() => {
+    calls += 1
+    close()
+  })
+  close()
+  close()
+  assert.equal(calls, 1)
+})
+
+test('shouldLogFailure evita repetir la misma línea sin parar', () => {
+  assert.equal(shouldLogFailure(1), true)
+  assert.equal(shouldLogFailure(3), true)
+  assert.equal(shouldLogFailure(4), false)
+  assert.equal(shouldLogFailure(10), true)
 })
 
 test('mapPool respeta la concurrencia y conserva el orden', async () => {
