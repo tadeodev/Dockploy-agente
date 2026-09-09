@@ -15,7 +15,7 @@ import { installChromium, isChromiumReady } from './chromium.js'
 import { runLoadTest } from './loadTest.js'
 import { normalizeScenario, type StartLoadTestCommand } from './loadTestTypes.js'
 
-const VERSION = '0.5.0'
+const VERSION = '0.5.1'
 const CONFIG_DIR = path.join(homedir(), '.dockploy-agent')
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json')
 const PID_PATH = path.join(CONFIG_DIR, 'agent.pid')
