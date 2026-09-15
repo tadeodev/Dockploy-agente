@@ -14,12 +14,14 @@ import { once } from './once.js'
 import { installChromium, isChromiumReady } from './chromium.js'
 import { runLoadTest } from './loadTest.js'
 import { normalizeScenario, type StartLoadTestCommand } from './loadTestTypes.js'
+import { installRoot, shouldAttemptUpdate, updateInstallation, type UpdateState } from './update.js'
 
 const VERSION = '0.5.1'
 const CONFIG_DIR = path.join(homedir(), '.dockploy-agent')
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json')
 const PID_PATH = path.join(CONFIG_DIR, 'agent.pid')
 const LOG_PATH = path.join(CONFIG_DIR, 'agent.log')
+const UPDATE_STATE_PATH = path.join(CONFIG_DIR, 'update.json')
 
 interface AgentConfig {
   serverUrl: string
@@ -96,12 +98,14 @@ Uso:
   dockploy-agent configure <URL_DOCKPLOY> <TOKEN_EQUIPO>
   dockploy-agent start          Arranca en segundo plano
   dockploy-agent stop           Detiene el proceso en segundo plano
+  dockploy-agent update         Descarga la última versión y reinicia
   dockploy-agent logs           Muestra el registro
   dockploy-agent run            Arranca en primer plano (ocupa la terminal)
   dockploy-agent prepare        Instala Chromium para simulaciones de carga
   dockploy-agent status
 
 Con start puedes cerrar la terminal: el agente sigue corriendo.
+Funciona desde cualquier carpeta y se actualiza solo cuando Dockploy lo pide.
 El login usa tu cuenta de Dockploy y renueva solo el token del equipo.
 
 Ejemplo:
@@ -563,7 +567,7 @@ function loadTestingHeartbeatPayload() {
 }
 
 async function heartbeat(config: AgentConfig): Promise<void> {
-  const response = await api<{ commands: AgentCommand[] }>(config, '/api/remote-agent/heartbeat', {
+  const response = await api<{ commands: AgentCommand[]; expectedAgentVersion?: string }>(config, '/api/remote-agent/heartbeat', {
     method: 'POST',
     body: JSON.stringify({
       hostname: hostname(),
@@ -582,6 +586,8 @@ async function heartbeat(config: AgentConfig): Promise<void> {
     else if (command.action === 'start-load-test') void startLoadTest(config, command)
     else if (command.action === 'cancel-load-test') cancelLoadTest(command.runId)
   }
+
+  await maybeAutoUpdate(response.expectedAgentVersion)
 }
 
 async function heartbeatWithRenewal(config: AgentConfig): Promise<AgentConfig> {
@@ -691,6 +697,50 @@ async function readDaemonPid(): Promise<number | null> {
   return null
 }
 
+async function readUpdateState(): Promise<UpdateState | undefined> {
+  try {
+    return JSON.parse(await readFile(UPDATE_STATE_PATH, 'utf8')) as UpdateState
+  } catch {
+    return undefined
+  }
+}
+
+async function writeUpdateState(state: UpdateState): Promise<void> {
+  await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 })
+  await writeFile(UPDATE_STATE_PATH, JSON.stringify(state), { mode: 0o600 })
+}
+
+/** Arranca el agente recién compilado y termina el proceso antiguo. */
+async function relaunchAfterUpdate(): Promise<void> {
+  await rm(PID_PATH, { force: true })
+  const log = openSync(LOG_PATH, 'a', 0o600)
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'start'], {
+    detached: true,
+    stdio: ['ignore', log, log],
+  })
+  child.unref()
+  process.exit(0)
+}
+
+async function maybeAutoUpdate(expected?: string): Promise<void> {
+  if (!expected) return
+  const state = await readUpdateState()
+  if (!shouldAttemptUpdate(expected, VERSION, state)) return
+
+  // Se anota antes de empezar: si la versión pedida no llega a publicarse, el
+  // agente no repite el git pull en cada latido.
+  await writeUpdateState({ target: expected, attemptedAt: Date.now() })
+  console.log(`Dockploy espera la versión ${expected} y esta es la ${VERSION}. Actualizando...`)
+
+  const outcome = updateInstallation(installRoot(import.meta.url), (line) => console.log(line))
+  if (!outcome.ok) {
+    console.error(`No se pudo actualizar: ${outcome.message}`)
+    return
+  }
+  console.log('Actualización aplicada. Reiniciando el agente...')
+  await relaunchAfterUpdate()
+}
+
 async function startDaemon(): Promise<void> {
   const running = await readDaemonPid()
   if (running) {
@@ -791,6 +841,22 @@ async function main(): Promise<void> {
     }
     await installChromium((line) => console.log(line))
     console.log('Chromium listo para simulaciones.')
+    return
+  }
+  if (command === 'update') {
+    const root = installRoot(import.meta.url)
+    console.log(`Actualizando ${root}`)
+    const outcome = updateInstallation(root, (line) => console.log(line))
+    if (!outcome.ok) {
+      console.error(outcome.message)
+      process.exitCode = 1
+      return
+    }
+    if (await readDaemonPid()) {
+      await stopDaemon()
+      await startDaemon()
+    }
+    console.log(outcome.message)
     return
   }
   if (command === 'start') {

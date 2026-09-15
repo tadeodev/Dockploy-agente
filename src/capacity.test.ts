@@ -6,6 +6,7 @@ import { once } from './once.js'
 import { buildTimeline } from './loadTest.js'
 import { looksLikeCssSelector, normalizeScenario, parseClickTarget } from './loadTestTypes.js'
 import type { VirtualUserResult } from './loadTestTypes.js'
+import { RETRY_AFTER_MS, isNewerVersion, shouldAttemptUpdate } from './update.js'
 
 test('recommendedConcurrency se acota a CPU, memoria y 25', () => {
   assert.equal(recommendedConcurrency({ cpus: 8, freeMem: 16 * 1024 * 1024 * 1024 }), 21)
@@ -81,6 +82,23 @@ test('parseClickTarget y CSS heurístico', () => {
   assert.deepEqual(parseClickTarget({ type: 'click', text: 'Comprar' }), { kind: 'text', value: 'Comprar' })
   assert.equal(looksLikeCssSelector('#submit'), true)
   assert.equal(looksLikeCssSelector('Comprar ahora'), false)
+})
+
+test('isNewerVersion compara por número y no por texto', () => {
+  assert.equal(isNewerVersion('0.5.1', '0.5.0'), true)
+  assert.equal(isNewerVersion('0.10.0', '0.9.0'), true)
+  assert.equal(isNewerVersion('0.5.0', '0.5.0'), false)
+  assert.equal(isNewerVersion('0.4.9', '0.5.0'), false)
+  assert.equal(isNewerVersion(undefined, '0.5.0'), false)
+})
+
+test('shouldAttemptUpdate no repite un objetivo que el repositorio aún no publica', () => {
+  assert.equal(shouldAttemptUpdate('0.5.1', '0.5.0', undefined), true)
+  const justTried = { target: '0.5.1', attemptedAt: 1_000 }
+  assert.equal(shouldAttemptUpdate('0.5.1', '0.5.0', justTried, 2_000), false)
+  assert.equal(shouldAttemptUpdate('0.5.1', '0.5.0', justTried, 1_000 + RETRY_AFTER_MS), true)
+  // Un objetivo distinto no arrastra la espera del anterior.
+  assert.equal(shouldAttemptUpdate('0.6.0', '0.5.0', justTried, 2_000), true)
 })
 
 test('buildTimeline agrupa peticiones por segundo', () => {

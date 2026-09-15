@@ -46,7 +46,28 @@ node dist/index.js stop      # lo detiene y cierra los túneles
 node dist/index.js run       # primer plano: ocupa la terminal, se corta al cerrarla
 ```
 
-Ficheros en `~/.dockploy-agent/` (Windows: `%USERPROFILE%\.dockploy-agent\`): `config.json`, `agent.pid` y `agent.log`.
+Ficheros en `~/.dockploy-agent/` (Windows: `%USERPROFILE%\.dockploy-agent\`): `config.json`, `agent.pid`, `agent.log` y `update.json`.
+
+## Actualizarlo
+
+**No tienes que hacer nada.** Cuando Dockploy empieza a pedir una versión más nueva,
+el agente se descarga el cambio, se recompila y se reinicia solo. Lo verás en `logs`.
+
+Si quieres forzarlo, este comando funciona **desde cualquier carpeta**:
+
+```bash
+node ~/Dockploy-agente/dist/index.js update
+```
+
+Para escribir solo `dockploy-agent update`, deja el comando en el PATH una vez:
+
+```bash
+cd ~/Dockploy-agente && npm link
+```
+
+Si tienes cambios locales sin guardar en esa carpeta, la actualización se detiene y
+te avisa, para no pisártelos. Si la compilación falla, el agente sigue con la
+versión anterior en lugar de quedarse a medias.
 
 El agente sobrevive a cerrar la terminal, pero **no** a apagar o suspender el ordenador ni a quedarte sin internet. Al volver a encender, arráncalo otra vez con `start` (o usa el servicio de abajo para que lo haga solo).
 
