@@ -6,7 +6,7 @@ import { once } from './once.js'
 import { buildTimeline } from './loadTest.js'
 import { looksLikeCssSelector, normalizeScenario, parseClickTarget } from './loadTestTypes.js'
 import type { VirtualUserResult } from './loadTestTypes.js'
-import { RETRY_AFTER_MS, isNewerVersion, shouldAttemptUpdate } from './update.js'
+import { RETRY_AFTER_MS, changedFiles, isNewerVersion, shouldAttemptUpdate } from './update.js'
 
 test('recommendedConcurrency se acota a CPU, memoria y 25', () => {
   assert.equal(recommendedConcurrency({ cpus: 8, freeMem: 16 * 1024 * 1024 * 1024 }), 21)
@@ -99,6 +99,16 @@ test('shouldAttemptUpdate no repite un objetivo que el repositorio aún no publi
   assert.equal(shouldAttemptUpdate('0.5.1', '0.5.0', justTried, 1_000 + RETRY_AFTER_MS), true)
   // Un objetivo distinto no arrastra la espera del anterior.
   assert.equal(shouldAttemptUpdate('0.6.0', '0.5.0', justTried, 2_000), true)
+})
+
+test('changedFiles lee la salida de git status con renombrados', () => {
+  assert.deepEqual(changedFiles(' M package-lock.json'), ['package-lock.json'])
+  // La salida llega recortada, así que la primera línea pierde el hueco del estado.
+  assert.deepEqual(changedFiles('M  package-lock.json\n M src/index.ts'), ['package-lock.json', 'src/index.ts'])
+  assert.deepEqual(changedFiles('M package-lock.json'), ['package-lock.json'])
+  assert.deepEqual(changedFiles('?? src/nuevo.ts\n M src/index.ts'), ['src/nuevo.ts', 'src/index.ts'])
+  assert.deepEqual(changedFiles('R  viejo.ts -> nuevo.ts'), ['nuevo.ts'])
+  assert.deepEqual(changedFiles(''), [])
 })
 
 test('buildTimeline agrupa peticiones por segundo', () => {
