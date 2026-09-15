@@ -48,6 +48,19 @@ export interface UpdateOutcome {
   message: string
 }
 
+/** `npm install` reescribe el lockfile, así que ese cambio no es trabajo de nadie. */
+export const REGENERATED_FILES = ['package-lock.json']
+
+export function changedFiles(porcelain: string): string[] {
+  return porcelain
+    .split('\n')
+    .filter((line) => line.trim().length > 0)
+    // Formato `XY ruta`, y `XY origen -> destino` en los renombrados. El primer
+    // hueco del estado puede venir recortado, así que no se corta por posición.
+    .map((line) => line.replace(/^\s?\S{1,2}\s+/, '').split(' -> ').pop()!.trim())
+    .filter((file) => file.length > 0)
+}
+
 function run(command: string, args: string[], cwd: string): { ok: boolean; output: string } {
   const result = spawnSync(command, args, { cwd, encoding: 'utf8' })
   const output = `${result.stdout || ''}${result.stderr || ''}`.trim()
@@ -67,7 +80,21 @@ export function updateInstallation(root: string, log: (line: string) => void): U
 
   const dirty = run('git', ['status', '--porcelain'], root)
   if (dirty.ok && dirty.output) {
-    return { ok: false, message: 'Hay cambios locales sin guardar; actualiza a mano para no perderlos.' }
+    const changed = changedFiles(dirty.output)
+    const blocking = changed.filter((file) => !REGENERATED_FILES.includes(file))
+    if (blocking.length > 0) {
+      return {
+        ok: false,
+        message: `Hay cambios locales sin guardar (${blocking.slice(0, 3).join(', ')}); actualiza a mano para no perderlos.`,
+      }
+    }
+    // Sin descartarlos, el lockfile que npm acaba de reescribir choca con el
+    // siguiente pull y la actualización automática no volvería a funcionar.
+    const regenerated = changed.filter((file) => REGENERATED_FILES.includes(file))
+    if (regenerated.length > 0) {
+      log(`Descartando cambios de npm en ${regenerated.join(', ')}`)
+      run('git', ['checkout', '--', ...regenerated], root)
+    }
   }
 
   for (const [command, args] of [
