@@ -56,14 +56,18 @@ el agente se descarga el cambio, se recompila y se reinicia solo. Lo verás en `
 Si quieres forzarlo, este comando funciona **desde cualquier carpeta**:
 
 ```bash
-node ~/Dockploy-agente/dist/index.js update
+dockploy-agent update
 ```
 
-Para escribir solo `dockploy-agent update`, deja el comando en el PATH una vez:
+Si sale `command not found`, es que el comando no está en el PATH. Déjalo puesto una
+vez, desde la carpeta donde clonaste el agente (no tiene que ser el home):
 
 ```bash
-cd ~/Dockploy-agente && npm link
+npm link
 ```
+
+También vale llamar al fichero con su ruta completa, sea la que sea:
+`node /ruta/a/Dockploy-agente/dist/index.js update`.
 
 Si tienes cambios locales sin guardar en esa carpeta, la actualización se detiene y
 te avisa, para no pisártelos. Si la compilación falla, el agente sigue con la
