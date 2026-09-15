@@ -341,7 +341,12 @@ function websocketUrl(serverUrl: string, path: string, token: string): string {
   return url.toString()
 }
 
-function pipeClientToDatabase(config: AgentConfig, sessionId: string, client: net.Socket): void {
+function pipeClientToDatabase(
+  config: AgentConfig,
+  sessionId: string,
+  client: net.Socket,
+  alias: string,
+): void {
   const WebSocketImpl = (globalThis as typeof globalThis & { WebSocket?: typeof WebSocket }).WebSocket
   if (!WebSocketImpl) {
     client.destroy()
@@ -376,8 +381,21 @@ function pipeClientToDatabase(config: AgentConfig, sessionId: string, client: ne
       }
     }
   })
-  ws.addEventListener('close', closeBoth)
-  ws.addEventListener('error', closeBoth)
+  ws.addEventListener('close', (event) => {
+    // Un cierre del servidor deja al cliente SQL esperando un saludo que no llega.
+    // Sin esta línea el fallo es mudo y parece que el puerto local no funciona.
+    const { code, reason } = event as CloseEvent
+    if (code && code !== 1000 && code !== 1005) {
+      console.error(`[${alias}] Dockploy cerró el túnel (${code}${reason ? `: ${reason}` : ''})`)
+    }
+    closeBoth()
+  })
+  ws.addEventListener('error', (event) => {
+    const detail = (event as ErrorEvent).message
+      || (event as unknown as { error?: { message?: string } }).error?.message
+    console.error(`[${alias}] No se pudo abrir el túnel con Dockploy${detail ? `: ${detail}` : ''}`)
+    closeBoth()
+  })
   client.on('error', closeBoth)
   client.on('close', closeBoth)
 }
@@ -389,7 +407,7 @@ async function startDbProxy(config: AgentConfig, command: StartDbProxyCommand): 
   const server = net.createServer((client) => {
     sockets.add(client)
     client.on('close', () => sockets.delete(client))
-    pipeClientToDatabase(config, command.sessionId, client)
+    pipeClientToDatabase(config, command.sessionId, client, command.alias)
   })
   const managed: ManagedDbProxy = { server, sockets, stopping: false }
   dbProxies.set(command.sessionId, managed)
