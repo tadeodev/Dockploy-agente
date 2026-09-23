@@ -17,7 +17,7 @@ import { normalizeScenario, type StartLoadTestCommand } from './loadTestTypes.js
 import { installRoot, shouldAttemptUpdate, updateInstallation, type UpdateState } from './update.js'
 import { describeRequestFailure, httpFailureMessage, REQUEST_TIMEOUT_MS } from './connection.js'
 
-const VERSION = '0.5.2'
+const VERSION = '0.5.3'
 const CONFIG_DIR = path.join(homedir(), '.dockploy-agent')
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json')
 const PID_PATH = path.join(CONFIG_DIR, 'agent.pid')
