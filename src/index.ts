@@ -2,21 +2,22 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { constants, openSync } from 'node:fs'
-import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, appendFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { cpus, freemem, homedir, hostname, platform, totalmem } from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
 import { fileURLToPath } from 'node:url'
 import { stdin as stdinStream, stdout as stdoutStream } from 'node:process'
-import { HEARTBEAT_MS, nextDelayMs, shouldLogFailure } from './backoff.js'
+import { HEARTBEAT_MS, nextDelayMs } from './backoff.js'
 import { recommendedConcurrency } from './capacity.js'
 import { once } from './once.js'
 import { installChromium, isChromiumReady } from './chromium.js'
 import { runLoadTest } from './loadTest.js'
 import { normalizeScenario, type StartLoadTestCommand } from './loadTestTypes.js'
 import { installRoot, shouldAttemptUpdate, updateInstallation, type UpdateState } from './update.js'
+import { describeRequestFailure, httpFailureMessage, REQUEST_TIMEOUT_MS } from './connection.js'
 
-const VERSION = '0.5.1'
+const VERSION = '0.5.2'
 const CONFIG_DIR = path.join(homedir(), '.dockploy-agent')
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json')
 const PID_PATH = path.join(CONFIG_DIR, 'agent.pid')
@@ -102,7 +103,7 @@ Uso:
   dockploy-agent logs           Muestra el registro
   dockploy-agent run            Arranca en primer plano (ocupa la terminal)
   dockploy-agent prepare        Instala Chromium para simulaciones de carga
-  dockploy-agent status
+  dockploy-agent status         Dice si el proceso corre y si Dockploy acepta el equipo
 
 Con start puedes cerrar la terminal: el agente sigue corriendo.
 Funciona desde cualquier carpeta y se actualiza solo cuando Dockploy lo pide.
@@ -154,17 +155,23 @@ async function postJson<T>(
   body: unknown,
   bearer?: string,
 ): Promise<T> {
-  const response = await fetch(`${serverUrl}${endpoint}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
-    },
-    body: JSON.stringify(body),
-  })
+  let response: Response
+  try {
+    response = await fetch(`${serverUrl}${endpoint}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    })
+  } catch (error) {
+    throw new Error(describeRequestFailure(error, endpoint))
+  }
   const payload = await response.json().catch(() => ({})) as { error?: string }
   if (!response.ok) {
-    throw new Error(payload.error || `Dockploy respondió ${response.status}`)
+    throw new Error(httpFailureMessage(response.status, endpoint, payload.error))
   }
   return payload as T
 }
@@ -220,21 +227,24 @@ async function api<T>(
   endpoint: string,
   init: RequestInit = {},
 ): Promise<T> {
-  const response = await fetch(`${config.serverUrl}${endpoint}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${config.token}`,
-      'Content-Type': 'application/json',
-      ...(init.headers || {}),
-    },
-  })
+  let response: Response
+  try {
+    response = await fetch(`${config.serverUrl}${endpoint}`, {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${config.token}`,
+        'Content-Type': 'application/json',
+        ...(init.headers || {}),
+      },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    })
+  } catch (error) {
+    throw new Error(describeRequestFailure(error, endpoint))
+  }
   const body = await response.json().catch(() => ({})) as { error?: string }
   if (!response.ok) {
-    const message = response.status === 429
-      ? 'Dockploy está limitando las peticiones de este equipo (429)'
-      : body.error || `Dockploy respondió ${response.status}`
     const retryAfter = Number(response.headers.get('retry-after'))
-    throw Object.assign(new Error(message), {
+    throw Object.assign(new Error(httpFailureMessage(response.status, endpoint, body.error)), {
       statusCode: response.status,
       retryAfterSeconds: Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined,
     })
@@ -566,18 +576,60 @@ function loadTestingHeartbeatPayload() {
   }
 }
 
-async function heartbeat(config: AgentConfig): Promise<void> {
-  const response = await api<{ commands: AgentCommand[]; expectedAgentVersion?: string }>(config, '/api/remote-agent/heartbeat', {
-    method: 'POST',
-    body: JSON.stringify({
-      hostname: hostname(),
-      platform: `${platform()}-${process.arch}`,
-      version: VERSION,
-      loadTesting: loadTestingHeartbeatPayload(),
-    }),
-  })
+interface HeartbeatBody {
+  connectorId?: string
+  commands?: AgentCommand[]
+  expectedAgentVersion?: string
+}
 
-  for (const command of response.commands) {
+interface HeartbeatInfo {
+  connectorId?: string
+  commandCount: number
+  elapsedMs: number
+}
+
+const HEARTBEAT_ENDPOINT = '/api/remote-agent/heartbeat'
+const CONNECTED_LOG_EVERY = 12
+
+function heartbeatBody(): string {
+  return JSON.stringify({
+    hostname: hostname(),
+    platform: `${platform()}-${process.arch}`,
+    version: VERSION,
+    loadTesting: loadTestingHeartbeatPayload(),
+  })
+}
+
+async function postHeartbeat(config: AgentConfig): Promise<{ body: HeartbeatBody; elapsedMs: number }> {
+  const started = Date.now()
+  const body = await api<HeartbeatBody>(config, HEARTBEAT_ENDPOINT, {
+    method: 'POST',
+    body: heartbeatBody(),
+  })
+  return { body, elapsedMs: Date.now() - started }
+}
+
+function logConnection(serverUrl: string, info: HeartbeatInfo, kind: 'connected' | 'still' | 'restored'): void {
+  const id = info.connectorId ? ` Equipo ${info.connectorId}.` : ''
+  const orders = info.commandCount > 0
+    ? ` Órdenes pendientes: ${info.commandCount}.`
+    : ' Sin órdenes pendientes.'
+  if (kind === 'restored') {
+    console.log(`Conexión con Dockploy restablecida (${info.elapsedMs} ms).${id}${orders}`)
+    return
+  }
+  if (kind === 'still') {
+    console.log(`Sigue conectado a ${serverUrl} (${info.elapsedMs} ms).${id}${orders}`)
+    return
+  }
+  console.log(`Conectado a ${serverUrl} (${info.elapsedMs} ms).${id}${orders}`)
+}
+
+async function heartbeat(config: AgentConfig): Promise<HeartbeatInfo> {
+  const { body, elapsedMs } = await postHeartbeat(config)
+  const commands = Array.isArray(body.commands) ? body.commands : []
+
+  for (const command of commands) {
     if (command.action === 'start') await startTunnel(config, command)
     else if (command.action === 'stop') await stopTunnel(config, command.tunnelId)
     else if (command.action === 'start-db-proxy') await startDbProxy(config, command)
@@ -585,21 +637,26 @@ async function heartbeat(config: AgentConfig): Promise<void> {
     else if (command.action === 'prepare-load-testing') void ensureChromium(config, command.runId)
     else if (command.action === 'start-load-test') void startLoadTest(config, command)
     else if (command.action === 'cancel-load-test') cancelLoadTest(command.runId)
+    else console.error(`Orden desconocida del servidor: ${String((command as { action?: unknown }).action)}`)
   }
 
-  await maybeAutoUpdate(response.expectedAgentVersion)
+  await maybeAutoUpdate(body.expectedAgentVersion)
+  return {
+    connectorId: body.connectorId ? String(body.connectorId) : undefined,
+    commandCount: commands.length,
+    elapsedMs,
+  }
 }
 
-async function heartbeatWithRenewal(config: AgentConfig): Promise<AgentConfig> {
+async function heartbeatWithRenewal(config: AgentConfig): Promise<{ config: AgentConfig; info: HeartbeatInfo }> {
   try {
-    await heartbeat(config)
-    return config
+    return { config, info: await heartbeat(config) }
   } catch (error: any) {
     if (!/Invalid connector token/i.test(error.message) || !config.refreshToken) throw error
     console.log('El token del equipo ya no vale. Renovando con la sesión de Dockploy...')
     const renewed = await renewDeviceToken(config)
-    await heartbeat(renewed)
-    return renewed
+    console.log('Token de equipo renovado. Reintentando el heartbeat...')
+    return { config: renewed, info: await heartbeat(renewed) }
   }
 }
 
@@ -615,7 +672,7 @@ async function runAgent(): Promise<void> {
   assertCloudflaredInstalled()
   chromiumReady = await isChromiumReady()
   console.log(`Dockploy Agent ${VERSION} iniciado en ${hostname()}`)
-  console.log(`Conectando con ${config.serverUrl}`)
+  console.log(`Conectando con ${config.serverUrl}${HEARTBEAT_ENDPOINT} (timeout ${REQUEST_TIMEOUT_MS / 1000} s)`)
   if (!chromiumReady) {
     console.log('Chromium no está instalado. Las simulaciones pedirán instalarlo o ejecuta: dockploy-agent prepare')
   }
@@ -649,28 +706,39 @@ async function runAgent(): Promise<void> {
   })
 
   let failures = 0
+  let successes = 0
   let retryAfterSeconds: number | undefined
 
   while (!stopping) {
+    const hadFailures = failures > 0
     try {
-      config = await heartbeatWithRenewal(config)
-      if (failures > 0) console.log('Conexión con Dockploy restablecida.')
+      const beat = await heartbeatWithRenewal(config)
+      config = beat.config
+      successes += 1
+      if (hadFailures || successes === 1 || successes % CONNECTED_LOG_EVERY === 0) {
+        const kind = hadFailures ? 'restored' : successes === 1 ? 'connected' : 'still'
+        logConnection(config.serverUrl, beat.info, kind)
+      }
       failures = 0
       retryAfterSeconds = undefined
     } catch (error: any) {
       failures += 1
+      successes = 0
       retryAfterSeconds = error.retryAfterSeconds
-      if (shouldLogFailure(failures)) {
-        console.error(`Heartbeat fallido (${failures}):`, error.message)
-      }
+      const delay = nextDelayMs({ failures, retryAfterSeconds })
+      console.error(
+        `Sin conexión con ${config.serverUrl} (intento ${failures}): ${error.message}. Reintento en ${Math.round(delay / 1000)} s.`,
+      )
       if (/Invalid connector token/i.test(error.message)) {
+        console.error('El panel no puede marcarlo conectado: Dockploy no reconoce el token de este equipo.')
         console.error('Vuelve a emparejar con: dockploy-agent login <URL> <EMAIL> <CONTRASEÑA>')
         shutdown()
         throw error
       }
+      await new Promise((resolve) => setTimeout(resolve, delay))
+      continue
     }
-    const delay = failures === 0 ? HEARTBEAT_MS : nextDelayMs({ failures, retryAfterSeconds })
-    await new Promise((resolve) => setTimeout(resolve, delay))
+    await new Promise((resolve) => setTimeout(resolve, HEARTBEAT_MS))
   }
 }
 
@@ -741,14 +809,26 @@ async function maybeAutoUpdate(expected?: string): Promise<void> {
   await relaunchAfterUpdate()
 }
 
+async function rememberStartupFailure(error: unknown): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error)
+  const line = `[${new Date().toISOString()}] No se pudo arrancar: ${message}\n`
+  await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 }).catch(() => undefined)
+  await appendFile(LOG_PATH, line).catch(() => undefined)
+}
+
 async function startDaemon(): Promise<void> {
   const running = await readDaemonPid()
   if (running) {
     console.log(`El agente ya está funcionando en segundo plano (PID ${running}).`)
     return
   }
-  await loadConfig()
-  assertCloudflaredInstalled()
+  try {
+    await loadConfig()
+    assertCloudflaredInstalled()
+  } catch (error) {
+    await rememberStartupFailure(error)
+    throw error
+  }
   await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 })
   const log = openSync(LOG_PATH, 'a', 0o600)
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'run'], {
@@ -817,9 +897,31 @@ async function main(): Promise<void> {
     await access(CONFIG_PATH, constants.R_OK)
     const config = await loadConfig()
     const pid = await readDaemonPid()
-    console.log(`Configurado para ${config.serverUrl}`)
-    console.log(pid ? `En segundo plano, funcionando (PID ${pid})` : 'Parado. Arráncalo con: dockploy-agent start')
+    const cloudflared = spawnSync('cloudflared', ['--version'], { stdio: 'ignore' })
+    console.log(`Dockploy Agent ${VERSION}`)
+    console.log(`Servidor: ${config.serverUrl}`)
+    console.log(pid ? `Proceso: en segundo plano (PID ${pid})` : 'Proceso: parado. Arráncalo con: dockploy-agent start')
+    console.log(cloudflared.error || cloudflared.status !== 0
+      ? 'cloudflared: no está instalado. Sin él el agente no arranca y el panel no lo marca conectado.'
+      : 'cloudflared: instalado')
     console.log(`Simulaciones: Chromium ${(await isChromiumReady()) ? 'listo' : 'pendiente (dockploy-agent prepare)'}`)
+    console.log(`Comprobando ${config.serverUrl}${HEARTBEAT_ENDPOINT} ...`)
+    try {
+      const { body, elapsedMs } = await postHeartbeat(config)
+      const id = body.connectorId ? String(body.connectorId) : 'sin id'
+      const orders = Array.isArray(body.commands) ? body.commands.length : 0
+      console.log(`Conectado. Dockploy aceptó el equipo ${id} en ${elapsedMs} ms. Órdenes pendientes: ${orders}.`)
+      if (!pid) {
+        console.log('El token vale, pero el proceso está parado: el panel volverá a offline en unos 30 segundos.')
+        console.log('Déjalo en marcha con: dockploy-agent start')
+      }
+    } catch (error: any) {
+      console.error(`No conecta: ${error.message}`)
+      if (/Invalid connector token/i.test(error.message)) {
+        console.error('Vuelve a emparejar con: dockploy-agent login <URL> <EMAIL> <CONTRASEÑA>')
+      }
+      process.exitCode = 1
+    }
     return
   }
   if (command === 'prepare') {
