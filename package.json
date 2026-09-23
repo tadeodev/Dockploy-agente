@@ -1,6 +1,6 @@
 {
   "name": "@dockploy/local-agent",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "private": true,
   "description": "Conector local para túneles remotos de Dockploy",
   "type": "module",
