@@ -14,7 +14,7 @@ import { once } from './once.js'
 import { installChromium, isChromiumReady } from './chromium.js'
 import { runLoadTest } from './loadTest.js'
 import { normalizeScenario, type StartLoadTestCommand } from './loadTestTypes.js'
-import { installRoot, shouldAttemptUpdate, updateInstallation, type UpdateState } from './update.js'
+import { installRoot, publishedInstallationProblem, shouldAttemptUpdate, updateInstallation, type UpdateState } from './update.js'
 import { describeRequestFailure, httpFailureMessage, REQUEST_TIMEOUT_MS } from './connection.js'
 
 const VERSION = '0.5.3'
@@ -107,7 +107,7 @@ Uso:
 
 Con start puedes cerrar la terminal: el agente sigue corriendo.
 Funciona desde cualquier carpeta y se actualiza solo cuando Dockploy lo pide.
-El login usa tu cuenta de Dockploy y renueva solo el token del equipo.
+El login usa tu cuenta un momento para crear el token del equipo y no guarda la sesión.
 
 Ejemplo:
   dockploy-agent login https://dockployback.gaolania.com.es ana@empresa.com tuclave
@@ -191,22 +191,20 @@ async function enrollDevice(
   return enrolled.token
 }
 
-async function refreshUserSession(config: AgentConfig): Promise<AgentConfig & { accessToken: string }> {
-  if (!config.refreshToken) throw new Error('No hay sesión de usuario guardada')
-  const session = await postJson<{ accessToken: string; refreshToken: string }>(
-    config.serverUrl,
-    '/api/auth/refresh',
-    { refreshToken: config.refreshToken },
-  )
-  const next = { ...config, refreshToken: session.refreshToken }
-  await writeConfig(next)
-  return { ...next, accessToken: session.accessToken }
-}
-
-async function renewDeviceToken(config: AgentConfig): Promise<AgentConfig> {
-  const withSession = await refreshUserSession(config)
-  const token = await enrollDevice(withSession.serverUrl, withSession.accessToken, hostname())
-  const next = { serverUrl: withSession.serverUrl, token, refreshToken: withSession.refreshToken }
+/** La sesión de usuario no se queda en el equipo: con ella el código local llamaría a Dockploy como el usuario. */
+async function discardUserSession(config: AgentConfig): Promise<AgentConfig> {
+  if (!config.refreshToken) return config
+  try {
+    const session = await postJson<{ accessToken: string }>(
+      config.serverUrl,
+      '/api/auth/refresh',
+      { refreshToken: config.refreshToken },
+    )
+    await postJson(config.serverUrl, '/api/auth/logout', {}, session.accessToken)
+  } catch {
+    // Si el token ya no vale, basta con borrarlo del disco.
+  }
+  const next = { serverUrl: config.serverUrl, token: config.token }
   await writeConfig(next)
   return next
 }
@@ -219,7 +217,8 @@ async function loginAndEnroll(serverUrl: string, identifier: string, password: s
     { email: identifier, password },
   )
   const token = await enrollDevice(url, session.accessToken, hostname())
-  await saveConfig(url, token, session.refreshToken)
+  await postJson(url, '/api/auth/logout', {}, session.accessToken).catch(() => undefined)
+  await saveConfig(url, token)
 }
 
 async function api<T>(
@@ -338,7 +337,7 @@ async function reportDbStatus(
   config: AgentConfig,
   sessionId: string,
   status: 'starting' | 'running' | 'error' | 'stopped',
-  extra: { error?: string; localPort?: number } = {},
+  extra: { error?: string; localPort?: number; reachable?: boolean } = {},
 ): Promise<void> {
   await api(config, `/api/remote-agent/db-proxies/${sessionId}/status`, {
     method: 'POST',
@@ -445,7 +444,58 @@ async function startDbProxy(config: AgentConfig, command: StartDbProxyCommand): 
     return
   }
   await reportDbStatus(config, command.sessionId, 'running', { localPort: address.port })
-  console.log(`[${command.alias}] Listo en 127.0.0.1:${address.port}`)
+  console.log(`[${command.alias}] Listo en 127.0.0.1:${address.port}. Comprobando que la base contesta...`)
+  const reachable = await probeLocalDatabase(command.engine, address.port)
+  await reportDbStatus(config, command.sessionId, 'running', { localPort: address.port, reachable })
+  console.log(reachable
+    ? `[${command.alias}] La base contesta en 127.0.0.1:${address.port}`
+    : `[${command.alias}] El puerto está abierto, pero la base no contesta`)
+}
+
+function probeLocalDatabase(engine: string, port: number, timeoutMs = 5_000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.connect({ host: '127.0.0.1', port })
+    let settled = false
+    const finish = (ok: boolean) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      socket.destroy()
+      resolve(ok)
+    }
+    const timer = setTimeout(() => finish(false), timeoutMs)
+    socket.once('data', () => finish(true))
+    socket.once('error', () => finish(false))
+    socket.once('connect', () => {
+      if (engine === 'mysql') return
+      socket.write(probePayload(engine))
+    })
+  })
+}
+
+function probePayload(engine: string): Buffer {
+  if (engine === 'redis') return Buffer.from('*1\r\n$4\r\nPING\r\n')
+  if (engine === 'postgres') {
+    const user = Buffer.from('user\0postgres\0\0')
+    const body = Buffer.alloc(8 + user.length)
+    body.writeInt32BE(body.length, 0)
+    body.writeInt32BE(196608, 4)
+    user.copy(body, 8)
+    return body
+  }
+  const query = Buffer.concat([
+    Buffer.from('admin.$cmd\0'),
+    Buffer.alloc(4),
+    Buffer.from([0xff, 0xff, 0xff, 0xff]),
+    Buffer.from([0x13, 0, 0, 0, 0x10]),
+    Buffer.from('ismaster\0'),
+    Buffer.from([1]),
+  ])
+  const header = Buffer.alloc(16)
+  header.writeInt32LE(16 + query.length, 0)
+  header.writeInt32LE(1, 4)
+  header.writeInt32LE(2004, 12)
+  return Buffer.concat([header, query])
 }
 
 async function stopDbProxy(config: AgentConfig, sessionId: string): Promise<void> {
@@ -649,15 +699,7 @@ async function heartbeat(config: AgentConfig): Promise<HeartbeatInfo> {
 }
 
 async function heartbeatWithRenewal(config: AgentConfig): Promise<{ config: AgentConfig; info: HeartbeatInfo }> {
-  try {
-    return { config, info: await heartbeat(config) }
-  } catch (error: any) {
-    if (!/Invalid connector token/i.test(error.message) || !config.refreshToken) throw error
-    console.log('El token del equipo ya no vale. Renovando con la sesión de Dockploy...')
-    const renewed = await renewDeviceToken(config)
-    console.log('Token de equipo renovado. Reintentando el heartbeat...')
-    return { config: renewed, info: await heartbeat(renewed) }
-  }
+  return { config, info: await heartbeat(config) }
 }
 
 function assertCloudflaredInstalled(): void {
@@ -668,7 +710,9 @@ function assertCloudflaredInstalled(): void {
 }
 
 async function runAgent(): Promise<void> {
-  let config = await loadConfig()
+  const tampered = await publishedInstallationProblem(installRoot(import.meta.url))
+  if (tampered) throw new Error(tampered)
+  let config = await discardUserSession(await loadConfig())
   assertCloudflaredInstalled()
   chromiumReady = await isChromiumReady()
   console.log(`Dockploy Agent ${VERSION} iniciado en ${hostname()}`)
@@ -800,7 +844,7 @@ async function maybeAutoUpdate(expected?: string): Promise<void> {
   await writeUpdateState({ target: expected, attemptedAt: Date.now() })
   console.log(`Dockploy espera la versión ${expected} y esta es la ${VERSION}. Actualizando...`)
 
-  const outcome = updateInstallation(installRoot(import.meta.url), (line) => console.log(line))
+  const outcome = await updateInstallation(installRoot(import.meta.url), (line) => console.log(line))
   if (!outcome.ok) {
     console.error(`No se pudo actualizar: ${outcome.message}`)
     return
@@ -825,6 +869,8 @@ async function startDaemon(): Promise<void> {
   try {
     await loadConfig()
     assertCloudflaredInstalled()
+    const tampered = await publishedInstallationProblem(installRoot(import.meta.url))
+    if (tampered) throw new Error(tampered)
   } catch (error) {
     await rememberStartupFailure(error)
     throw error
@@ -880,7 +926,7 @@ async function main(): Promise<void> {
       return
     }
     await loginAndEnroll(args[0], args[1], args[2])
-    console.log(`Sesión y token de equipo guardados en ${CONFIG_PATH}`)
+    console.log(`Token de equipo guardado en ${CONFIG_PATH}`)
     return
   }
   if (command === 'configure') {
@@ -948,7 +994,7 @@ async function main(): Promise<void> {
   if (command === 'update') {
     const root = installRoot(import.meta.url)
     console.log(`Actualizando ${root}`)
-    const outcome = updateInstallation(root, (line) => console.log(line))
+    const outcome = await updateInstallation(root, (line) => console.log(line))
     if (!outcome.ok) {
       console.error(outcome.message)
       process.exitCode = 1

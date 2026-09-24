@@ -16,7 +16,7 @@ node dist/index.js start
 
 `start` deja el agente **en segundo plano**: puedes cerrar la terminal y los túneles siguen abiertos. Para pararlo, `node dist/index.js stop` (los túneles publicados dejan de responder).
 
-No guarda la contraseña; guarda un token de equipo y la sesión para poder renovarlo. El `dcp_...` del panel **no caduca** por tiempo: solo deja de valer si revocas el equipo o si `login` genera uno nuevo.
+No guarda la contraseña ni la sesión. Guarda solo el token de equipo. El `dcp_...` del panel **no caduca** por tiempo: solo deja de valer si revocas el equipo o si `login` genera uno nuevo. Si deja de valer, hay que volver a hacer `login`.
 
 También puedes copiar el `dcp_...` del panel (**Túneles locales → Registrar equipo**) y usar `configure` como hasta ahora.
 
@@ -52,6 +52,12 @@ Ficheros en `~/.dockploy-agent/` (Windows: `%USERPROFILE%\.dockploy-agent\`): `c
 
 **No tienes que hacer nada.** Cuando Dockploy empieza a pedir una versión más nueva,
 el agente se descarga el cambio, se recompila y se reinicia solo. Lo verás en `logs`.
+
+Solo instala el commit que GitHub tiene firmado en `main` de
+`tadeodev/Dockploy-agente`. Si el remoto apunta a otro sitio, o el commit no
+está firmado, la actualización se detiene y sigue con la versión que ya corre.
+Tampoco arranca si esa copia tiene cambios sin subir o commits que no están en `main`.
+`npm ci` no ejecuta scripts de instalación de dependencias.
 
 Si quieres forzarlo, este comando funciona **desde cualquier carpeta**:
 
@@ -136,7 +142,7 @@ Para quitarlo: `launchctl unload -w ~/Library/LaunchAgents/com.dockploy.agent.pl
 ## Problemas
 
 - **permission denied / command not found:** no uses `sudo`. `node dist/index.js login …` o `configure` y `start`.
-- **Invalid connector token:** `node dist/index.js login https://dockployback.gaolania.com.es EMAIL CONTRASEÑA` y vuelve a `start`. El agente renueva el token si aún tiene sesión.
+- **Invalid connector token:** `node dist/index.js login https://dockployback.gaolania.com.es EMAIL CONTRASEÑA` y vuelve a `start`.
 - **Offline en el panel:** mira `node dist/index.js status`; si está parado, `start`. Si dice que funciona, `node dist/index.js logs` te cuenta qué falla.
 - **"Ya hay un agente en segundo plano":** `node dist/index.js stop` antes de volver a arrancar.
 - **No hay aplicación escuchando:** abre `http://127.0.0.1:PUERTO` en este PC.
