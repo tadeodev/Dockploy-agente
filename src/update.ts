@@ -48,8 +48,51 @@ export interface UpdateOutcome {
   message: string
 }
 
-/** `npm install` reescribe el lockfile, así que ese cambio no es trabajo de nadie. */
+/** `npm ci` reescribe el lockfile, así que ese cambio no es trabajo de nadie. */
 export const REGENERATED_FILES = ['package-lock.json']
+
+/** El código que se ejecuta solo puede salir de este repositorio. */
+export const OFFICIAL_REPOSITORY = 'tadeodev/Dockploy-agente'
+const GITHUB_MAIN_COMMIT = `https://api.github.com/repos/${OFFICIAL_REPOSITORY}/commits/main`
+
+export function isOfficialRemote(url: string): boolean {
+  const normalized = url.trim().replace(/\.git$/, '').replace(/\/$/, '')
+  return normalized === `https://github.com/${OFFICIAL_REPOSITORY}`
+    || normalized === `git@github.com:${OFFICIAL_REPOSITORY}`
+    || normalized === `ssh://git@github.com/${OFFICIAL_REPOSITORY}`
+}
+
+export interface RemoteCommit {
+  sha: string
+  verified: boolean
+}
+
+/**
+ * Cambios sin subir, o commits que no están en el main firmado, no pueden
+ * arrancar: esa copia no es la que está publicada.
+ */
+export function localInstallBlockReason(input: {
+  porcelain: string
+  head: string
+  officialSha: string
+  ancestor: boolean
+}): string | undefined {
+  const changed = changedFiles(input.porcelain)
+  if (changed.length > 0) {
+    return `Hay cambios locales sin subir (${changed.slice(0, 3).join(', ')}). El agente no arranca con código modificado.`
+  }
+  const head = input.head.trim().toLowerCase()
+  const official = input.officialSha.trim().toLowerCase()
+  if (!head || !official) return 'No se pudo comprobar que esta copia es la publicada.'
+  if (head === official || input.ancestor) return undefined
+  return 'Esta copia tiene commits que no están en main. El agente no arranca con código sin publicar.'
+}
+
+/** El commit descargado tiene que ser exactamente el que GitHub firma en main. */
+export function commitIsTrusted(fetchedSha: string, remote?: RemoteCommit | null): boolean {
+  if (!remote?.verified || !remote.sha) return false
+  return fetchedSha.trim().toLowerCase() === remote.sha.trim().toLowerCase()
+}
 
 export function changedFiles(porcelain: string): string[] {
   return porcelain
@@ -68,11 +111,65 @@ function run(command: string, args: string[], cwd: string): { ok: boolean; outpu
   return { ok: result.status === 0, output }
 }
 
+async function githubMainCommit(): Promise<RemoteCommit | undefined> {
+  let response: Response
+  try {
+    response = await fetch(GITHUB_MAIN_COMMIT, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'dockploy-agent',
+      },
+      signal: AbortSignal.timeout(20_000),
+    })
+  } catch {
+    return undefined
+  }
+  if (!response.ok) return undefined
+  const body = await response.json().catch(() => null) as {
+    sha?: string
+    commit?: { verification?: { verified?: boolean } }
+  } | null
+  if (!body?.sha) return undefined
+  return { sha: body.sha, verified: body.commit?.verification?.verified === true }
+}
+
+/** Niega el arranque si la copia local no es el main firmado del repositorio oficial. */
+export async function publishedInstallationProblem(root: string): Promise<string | undefined> {
+  const inside = run('git', ['rev-parse', '--is-inside-work-tree'], root)
+  if (!inside.ok) return `${root} no es un repositorio git.`
+
+  const origin = run('git', ['remote', 'get-url', 'origin'], root)
+  if (!origin.ok || !isOfficialRemote(origin.output)) {
+    return 'El remoto no es github.com/tadeodev/Dockploy-agente.'
+  }
+
+  const dirty = run('git', ['status', '--porcelain'], root)
+  if (!dirty.ok) return 'No se pudo comprobar si hay cambios locales.'
+  const head = run('git', ['rev-parse', 'HEAD'], root)
+  if (!head.ok) return 'No se pudo leer el commit local.'
+
+  const fetched = run('git', ['fetch', 'origin', 'main'], root)
+  if (!fetched.ok) return 'No se pudo comprobar main en el repositorio oficial.'
+  const remote = await githubMainCommit()
+  if (!commitIsTrusted(run('git', ['rev-parse', 'FETCH_HEAD'], root).output, remote)) {
+    return 'No se pudo comprobar en GitHub que main está firmado.'
+  }
+
+  const ancestor = run('git', ['merge-base', '--is-ancestor', head.output.trim(), remote!.sha], root)
+  return localInstallBlockReason({
+    porcelain: dirty.output,
+    head: head.output,
+    officialSha: remote!.sha,
+    ancestor: ancestor.ok,
+  })
+}
+
 /**
  * Actualiza la copia local desde git y la recompila. No reinicia nada: si la
  * compilación falla, el `dist` anterior sigue en pie y el agente puede seguir.
+ * Solo instala el commit que GitHub tiene firmado en main del repositorio oficial.
  */
-export function updateInstallation(root: string, log: (line: string) => void): UpdateOutcome {
+export async function updateInstallation(root: string, log: (line: string) => void): Promise<UpdateOutcome> {
   const inside = run('git', ['rev-parse', '--is-inside-work-tree'], root)
   if (!inside.ok) {
     return { ok: false, message: `${root} no es un repositorio git; actualízalo como lo instalaste.` }
@@ -97,9 +194,41 @@ export function updateInstallation(root: string, log: (line: string) => void): U
     }
   }
 
+  const branch = run('git', ['rev-parse', '--abbrev-ref', 'HEAD'], root)
+  if (!branch.ok || branch.output.trim() !== 'main') {
+    return { ok: false, message: 'El agente solo se actualiza desde la rama main del repositorio oficial.' }
+  }
+
+  const origin = run('git', ['remote', 'get-url', 'origin'], root)
+  if (!origin.ok || !isOfficialRemote(origin.output)) {
+    return { ok: false, message: 'El remoto no es github.com/tadeodev/Dockploy-agente; no se actualiza.' }
+  }
+
+  log('Actualizando: git fetch origin main')
+  const fetched = run('git', ['fetch', 'origin', 'main'], root)
+  if (!fetched.ok) {
+    return { ok: false, message: `Falló git fetch origin main: ${fetched.output.slice(-500)}` }
+  }
+
+  const fetchedSha = run('git', ['rev-parse', 'FETCH_HEAD'], root)
+  if (!fetchedSha.ok) {
+    return { ok: false, message: 'No se pudo leer el commit descargado.' }
+  }
+
+  const remote = await githubMainCommit()
+  if (!remote) {
+    return { ok: false, message: 'No se pudo comprobar en GitHub que el commit está firmado; no se instala.' }
+  }
+  if (!commitIsTrusted(fetchedSha.output, remote)) {
+    return {
+      ok: false,
+      message: 'El commit descargado no es el que GitHub firma en main; no se instala.',
+    }
+  }
+
   for (const [command, args] of [
-    ['git', ['pull', '--ff-only']],
-    ['npm', ['install', '--no-audit', '--no-fund']],
+    ['git', ['merge', '--ff-only', 'FETCH_HEAD']],
+    ['npm', ['ci', '--ignore-scripts', '--no-audit', '--no-fund']],
     ['npm', ['run', 'build']],
   ] as const) {
     log(`Actualizando: ${command} ${args.join(' ')}`)

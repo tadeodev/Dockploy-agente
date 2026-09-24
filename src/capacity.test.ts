@@ -6,7 +6,15 @@ import { once } from './once.js'
 import { buildTimeline } from './loadTest.js'
 import { looksLikeCssSelector, normalizeScenario, parseClickTarget } from './loadTestTypes.js'
 import type { VirtualUserResult } from './loadTestTypes.js'
-import { RETRY_AFTER_MS, changedFiles, isNewerVersion, shouldAttemptUpdate } from './update.js'
+import {
+  RETRY_AFTER_MS,
+  changedFiles,
+  commitIsTrusted,
+  isNewerVersion,
+  isOfficialRemote,
+  localInstallBlockReason,
+  shouldAttemptUpdate,
+} from './update.js'
 
 test('recommendedConcurrency se acota a CPU, memoria y 25', () => {
   assert.equal(recommendedConcurrency({ cpus: 8, freeMem: 16 * 1024 * 1024 * 1024 }), 21)
@@ -99,6 +107,46 @@ test('shouldAttemptUpdate no repite un objetivo que el repositorio aún no publi
   assert.equal(shouldAttemptUpdate('0.5.1', '0.5.0', justTried, 1_000 + RETRY_AFTER_MS), true)
   // Un objetivo distinto no arrastra la espera del anterior.
   assert.equal(shouldAttemptUpdate('0.6.0', '0.5.0', justTried, 2_000), true)
+})
+
+test('solo el remoto oficial y el commit firmado de main pueden instalarse', () => {
+  assert.equal(isOfficialRemote('https://github.com/tadeodev/Dockploy-agente.git'), true)
+  assert.equal(isOfficialRemote('git@github.com:tadeodev/Dockploy-agente.git'), true)
+  assert.equal(isOfficialRemote('https://github.com/otro/Dockploy-agente.git'), false)
+  const sha = '628811c65c73b3f2611d4e5b0144abba005241c9'
+  assert.equal(commitIsTrusted(sha, { sha, verified: true }), true)
+  assert.equal(commitIsTrusted(sha.toUpperCase(), { sha, verified: true }), true)
+  assert.equal(commitIsTrusted(sha, { sha, verified: false }), false)
+  assert.equal(commitIsTrusted('otro', { sha, verified: true }), false)
+  assert.equal(commitIsTrusted(sha, null), false)
+})
+
+test('el agente no arranca con cambios locales ni con commits fuera de main', () => {
+  const official = '628811c65c73b3f2611d4e5b0144abba005241c9'
+  assert.equal(localInstallBlockReason({
+    porcelain: '',
+    head: official,
+    officialSha: official,
+    ancestor: true,
+  }), undefined)
+  assert.match(localInstallBlockReason({
+    porcelain: ' M src/index.ts',
+    head: official,
+    officialSha: official,
+    ancestor: true,
+  }) || '', /src\/index.ts/)
+  assert.match(localInstallBlockReason({
+    porcelain: '',
+    head: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    officialSha: official,
+    ancestor: false,
+  }) || '', /sin publicar/)
+  assert.equal(localInstallBlockReason({
+    porcelain: '',
+    head: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    officialSha: official,
+    ancestor: true,
+  }), undefined)
 })
 
 test('changedFiles lee la salida de git status con renombrados', () => {
