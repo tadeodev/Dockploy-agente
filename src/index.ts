@@ -630,6 +630,7 @@ interface HeartbeatBody {
   connectorId?: string
   commands?: AgentCommand[]
   expectedAgentVersion?: string
+  forceUpdate?: boolean
 }
 
 interface HeartbeatInfo {
@@ -690,7 +691,8 @@ async function heartbeat(config: AgentConfig): Promise<HeartbeatInfo> {
     else console.error(`Orden desconocida del servidor: ${String((command as { action?: unknown }).action)}`)
   }
 
-  await maybeAutoUpdate(body.expectedAgentVersion)
+  if (body.forceUpdate) await forceUpdate(config)
+  else await maybeAutoUpdate(body.expectedAgentVersion)
   return {
     connectorId: body.connectorId ? String(body.connectorId) : undefined,
     commandCount: commands.length,
@@ -832,6 +834,23 @@ async function relaunchAfterUpdate(): Promise<void> {
   })
   child.unref()
   process.exit(0)
+}
+
+async function forceUpdate(config: AgentConfig): Promise<void> {
+  try {
+    await api(config, '/api/remote-agent/update-ack', { method: 'POST', body: '{}' })
+  } catch (error: any) {
+    console.error(`No se pudo confirmar la actualización pedida: ${error.message}`)
+    return
+  }
+  console.log('Dockploy pidió actualizar ahora.')
+  const outcome = await updateInstallation(installRoot(import.meta.url), (line) => console.log(line))
+  if (!outcome.ok) {
+    console.error(`No se pudo actualizar: ${outcome.message}`)
+    return
+  }
+  console.log('Actualización aplicada. Reiniciando el agente...')
+  await relaunchAfterUpdate()
 }
 
 async function maybeAutoUpdate(expected?: string): Promise<void> {

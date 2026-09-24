@@ -129,6 +129,12 @@ test('el agente no arranca con cambios locales ni con commits fuera de main', ()
     officialSha: official,
     ancestor: true,
   }), undefined)
+  assert.equal(localInstallBlockReason({
+    porcelain: ' M package-lock.json',
+    head: official,
+    officialSha: official,
+    ancestor: true,
+  }), undefined)
   assert.match(localInstallBlockReason({
     porcelain: ' M src/index.ts',
     head: official,
