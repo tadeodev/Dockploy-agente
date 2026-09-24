@@ -77,7 +77,7 @@ export function localInstallBlockReason(input: {
   officialSha: string
   ancestor: boolean
 }): string | undefined {
-  const changed = changedFiles(input.porcelain)
+  const changed = changedFiles(input.porcelain).filter((file) => !REGENERATED_FILES.includes(file))
   if (changed.length > 0) {
     return `Hay cambios locales sin subir (${changed.slice(0, 3).join(', ')}). El agente no arranca con código modificado.`
   }
