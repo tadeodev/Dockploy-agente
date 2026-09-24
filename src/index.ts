@@ -372,21 +372,34 @@ function pipeClientToDatabase(
   const ws = new WebSocketImpl(websocketUrl(config.serverUrl, `/api/remote-agent/db-proxy/${sessionId}`, config.token))
   ws.binaryType = 'arraybuffer'
   const pending: Buffer[] = []
+  let sent = 0
+  let received = 0
   const send = (chunk: Buffer) => {
+    sent += chunk.length
     if (ws.readyState === WebSocketImpl.OPEN) ws.send(new Uint8Array(chunk))
     else pending.push(chunk)
   }
   client.on('data', (chunk) => send(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)))
   ws.addEventListener('open', () => {
+    console.log(`[${alias}] túnel abierto, pendientes=${pending.reduce((sum, chunk) => sum + chunk.length, 0)} bytes`)
     for (const chunk of pending) ws.send(new Uint8Array(chunk))
     pending.length = 0
   })
   ws.addEventListener('message', (event) => {
     const raw = event.data
     if (client.destroyed) return
-    if (raw instanceof ArrayBuffer) client.write(Buffer.from(raw))
-    else if (Buffer.isBuffer(raw)) client.write(raw)
-    else if (typeof raw === 'string') client.write(raw)
+    if (raw instanceof ArrayBuffer) {
+      received += raw.byteLength
+      client.write(Buffer.from(raw))
+    } else if (Buffer.isBuffer(raw)) {
+      received += raw.length
+      client.write(raw)
+    } else if (typeof raw === 'string') {
+      received += Buffer.byteLength(raw)
+      client.write(raw)
+    } else {
+      console.error(`[${alias}] mensaje del túnel ignorado`)
+    }
   })
   const closeBoth = once(() => {
     client.destroy()
@@ -402,9 +415,7 @@ function pipeClientToDatabase(
     // Un cierre del servidor deja al cliente SQL esperando un saludo que no llega.
     // Sin esta línea el fallo es mudo y parece que el puerto local no funciona.
     const { code, reason } = event as CloseEvent
-    if (code && code !== 1000 && code !== 1005) {
-      console.error(`[${alias}] Dockploy cerró el túnel (${code}${reason ? `: ${reason}` : ''})`)
-    }
+    console.error(`[${alias}] túnel cerrado (${code || 0}${reason ? `: ${reason}` : ''}) enviados=${sent} recibidos=${received}`)
     closeBoth()
   })
   ws.addEventListener('error', (event) => {
