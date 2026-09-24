@@ -83,6 +83,10 @@ interface ManagedDbProxy {
   server: net.Server
   sockets: Set<net.Socket>
   stopping: boolean
+  localPort?: number
+  engine?: string
+  reachable?: boolean
+  probing?: boolean
 }
 
 const processes = new Map<string, ManagedProcess>()
@@ -414,7 +418,18 @@ function pipeClientToDatabase(
 }
 
 async function startDbProxy(config: AgentConfig, command: StartDbProxyCommand): Promise<void> {
-  if (dbProxies.has(command.sessionId)) return
+  const existing = dbProxies.get(command.sessionId)
+  if (existing) {
+    if (existing.reachable || existing.probing || !existing.localPort) return
+    existing.probing = true
+    const reachable = await probeLocalDatabase(existing.engine || command.engine, existing.localPort)
+    existing.probing = false
+    if (!reachable || !dbProxies.has(command.sessionId)) return
+    existing.reachable = true
+    await reportDbStatus(config, command.sessionId, 'running', { localPort: existing.localPort, reachable: true })
+    console.log(`[${command.alias}] La base contesta en 127.0.0.1:${existing.localPort}`)
+    return
+  }
   console.log(`[${command.alias}] Abriendo ${command.engine} en este equipo...`)
   const sockets = new Set<net.Socket>()
   const server = net.createServer((client) => {
@@ -422,7 +437,7 @@ async function startDbProxy(config: AgentConfig, command: StartDbProxyCommand): 
     client.on('close', () => sockets.delete(client))
     pipeClientToDatabase(config, command.sessionId, client, command.alias)
   })
-  const managed: ManagedDbProxy = { server, sockets, stopping: false }
+  const managed: ManagedDbProxy = { server, sockets, stopping: false, engine: command.engine }
   dbProxies.set(command.sessionId, managed)
   await reportDbStatus(config, command.sessionId, 'starting')
 
@@ -446,7 +461,11 @@ async function startDbProxy(config: AgentConfig, command: StartDbProxyCommand): 
   await reportDbStatus(config, command.sessionId, 'running', { localPort: address.port })
   console.log(`[${command.alias}] Listo en 127.0.0.1:${address.port}. Comprobando que la base contesta...`)
   const reachable = await probeLocalDatabase(command.engine, address.port)
-  await reportDbStatus(config, command.sessionId, 'running', { localPort: address.port, reachable })
+  managed.localPort = address.port
+  managed.reachable = reachable
+  if (reachable) {
+    await reportDbStatus(config, command.sessionId, 'running', { localPort: address.port, reachable: true })
+  }
   console.log(reachable
     ? `[${command.alias}] La base contesta en 127.0.0.1:${address.port}`
     : `[${command.alias}] El puerto está abierto, pero la base no contesta`)
@@ -484,18 +503,24 @@ function probePayload(engine: string): Buffer {
     return body
   }
   const query = Buffer.concat([
-    Buffer.from('admin.$cmd\0'),
-    Buffer.alloc(4),
-    Buffer.from([0xff, 0xff, 0xff, 0xff]),
-    Buffer.from([0x13, 0, 0, 0, 0x10]),
-    Buffer.from('ismaster\0'),
-    Buffer.from([1]),
+    Buffer.from([0x10]),
+    Buffer.from('hello\0'),
+    Buffer.from([1, 0, 0, 0]),
+    Buffer.from([0x02]),
+    Buffer.from('$db\0'),
+    Buffer.from([6, 0, 0, 0]),
+    Buffer.from('admin\0'),
+    Buffer.from([0]),
   ])
-  const header = Buffer.alloc(16)
-  header.writeInt32LE(16 + query.length, 0)
+  const document = Buffer.alloc(4 + query.length)
+  document.writeInt32LE(document.length, 0)
+  query.copy(document, 4)
+  const header = Buffer.alloc(16 + 4 + 1)
+  header.writeInt32LE(header.length + document.length, 0)
   header.writeInt32LE(1, 4)
-  header.writeInt32LE(2004, 12)
-  return Buffer.concat([header, query])
+  header.writeInt32LE(2013, 12)
+  header.writeUInt8(0, 20)
+  return Buffer.concat([header, document])
 }
 
 async function stopDbProxy(config: AgentConfig, sessionId: string): Promise<void> {
