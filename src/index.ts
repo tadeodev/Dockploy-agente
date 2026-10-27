@@ -16,8 +16,14 @@ import { runLoadTest } from './loadTest.js'
 import { normalizeScenario, type StartLoadTestCommand } from './loadTestTypes.js'
 import { installRoot, publishedInstallationProblem, shouldAttemptUpdate, updateInstallation, type UpdateState } from './update.js'
 import { describeRequestFailure, httpFailureMessage, REQUEST_TIMEOUT_MS } from './connection.js'
+import {
+  CLOUDFLARED_UPDATE_EVERY_MS,
+  cloudflaredBlockReason,
+  readCloudflaredVersion,
+  updateCloudflared,
+} from './cloudflared.js'
 
-const VERSION = '0.5.3'
+const VERSION = '0.5.4'
 const CONFIG_DIR = path.join(homedir(), '.dockploy-agent')
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json')
 const PID_PATH = path.join(CONFIG_DIR, 'agent.pid')
@@ -285,6 +291,11 @@ async function portIsOpen(port: number): Promise<boolean> {
 
 async function startTunnel(config: AgentConfig, command: StartCommand): Promise<void> {
   if (processes.has(command.tunnelId)) return
+  const cloudflaredViejo = cloudflaredBlockReason(cloudflaredVersion, expectedCloudflaredVersion)
+  if (cloudflaredViejo) {
+    await reportStatus(config, command.tunnelId, 'error', cloudflaredViejo)
+    return
+  }
   if (!await portIsOpen(command.port)) {
     await reportStatus(
       config,
@@ -666,7 +677,27 @@ interface HeartbeatBody {
   connectorId?: string
   commands?: AgentCommand[]
   expectedAgentVersion?: string
+  expectedCloudflaredVersion?: string
   forceUpdate?: boolean
+}
+
+let cloudflaredVersion: string | null = null
+let expectedCloudflaredVersion: string | undefined
+let lastCloudflaredUpdateAt = 0
+let cloudflaredRetriedFor: string | undefined
+
+function maintainCloudflared(): void {
+  if (Date.now() - lastCloudflaredUpdateAt < CLOUDFLARED_UPDATE_EVERY_MS) {
+    cloudflaredVersion = readCloudflaredVersion()
+    return
+  }
+  lastCloudflaredUpdateAt = Date.now()
+  const outcome = updateCloudflared()
+  console.log(outcome.ok
+    ? `cloudflared: ${outcome.message}`
+    : `No se pudo actualizar cloudflared: ${outcome.message}`)
+  cloudflaredVersion = readCloudflaredVersion()
+  if (cloudflaredVersion) console.log(`cloudflared ${cloudflaredVersion}`)
 }
 
 interface HeartbeatInfo {
@@ -683,6 +714,7 @@ function heartbeatBody(): string {
     hostname: hostname(),
     platform: `${platform()}-${process.arch}`,
     version: VERSION,
+    cloudflaredVersion: cloudflaredVersion || undefined,
     loadTesting: loadTestingHeartbeatPayload(),
   })
 }
@@ -715,6 +747,16 @@ function logConnection(serverUrl: string, info: HeartbeatInfo, kind: 'connected'
 async function heartbeat(config: AgentConfig): Promise<HeartbeatInfo> {
   const { body, elapsedMs } = await postHeartbeat(config)
   const commands = Array.isArray(body.commands) ? body.commands : []
+  if (body.expectedCloudflaredVersion) expectedCloudflaredVersion = body.expectedCloudflaredVersion
+  if (
+    expectedCloudflaredVersion
+    && cloudflaredBlockReason(cloudflaredVersion, expectedCloudflaredVersion)
+    && cloudflaredRetriedFor !== expectedCloudflaredVersion
+  ) {
+    cloudflaredRetriedFor = expectedCloudflaredVersion
+    lastCloudflaredUpdateAt = 0
+    maintainCloudflared()
+  }
 
   for (const command of commands) {
     if (command.action === 'start') await startTunnel(config, command)
@@ -752,6 +794,7 @@ async function runAgent(): Promise<void> {
   if (tampered) throw new Error(tampered)
   let config = await discardUserSession(await loadConfig())
   assertCloudflaredInstalled()
+  maintainCloudflared()
   chromiumReady = await isChromiumReady()
   console.log(`Dockploy Agent ${VERSION} iniciado en ${hostname()}`)
   console.log(`Conectando con ${config.serverUrl}${HEARTBEAT_ENDPOINT} (timeout ${REQUEST_TIMEOUT_MS / 1000} s)`)
@@ -794,6 +837,7 @@ async function runAgent(): Promise<void> {
   while (!stopping) {
     const hadFailures = failures > 0
     try {
+      maintainCloudflared()
       const beat = await heartbeatWithRenewal(config)
       config = beat.config
       successes += 1
@@ -1002,9 +1046,10 @@ async function main(): Promise<void> {
     console.log(`Dockploy Agent ${VERSION}`)
     console.log(`Servidor: ${config.serverUrl}`)
     console.log(pid ? `Proceso: en segundo plano (PID ${pid})` : 'Proceso: parado. Arráncalo con: dockploy-agent start')
+    const versionInstalada = readCloudflaredVersion()
     console.log(cloudflared.error || cloudflared.status !== 0
       ? 'cloudflared: no está instalado. Sin él el agente no arranca y el panel no lo marca conectado.'
-      : 'cloudflared: instalado')
+      : `cloudflared: ${versionInstalada || 'instalado'}`)
     console.log(`Simulaciones: Chromium ${(await isChromiumReady()) ? 'listo' : 'pendiente (dockploy-agent prepare)'}`)
     console.log(`Comprobando ${config.serverUrl}${HEARTBEAT_ENDPOINT} ...`)
     try {
